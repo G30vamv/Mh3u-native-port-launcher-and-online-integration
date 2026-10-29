@@ -156,7 +156,7 @@ def write_apply_script(todo, base_dir, version):
         'if not errorlevel 1 ("{S32}ping.exe" -n 2 127.0.0.1 >nul & goto wait)'.replace('{S32}', S32),
         '"{S32}taskkill.exe" /F /IM mh3u-tools.exe >nul 2>&1'.replace('{S32}', S32),
         '"{S32}taskkill.exe" /F /IM server.exe >nul 2>&1'.replace('{S32}', S32),
-        '"{S32}ping.exe" -n 2 127.0.0.1 >nul'.replace('{S32}', S32),
+        '"{S32}ping.exe" -n 4 127.0.0.1 >nul'.replace('{S32}', S32),
         "echo [%date% %time%] apply_update: aplicando archivos",
         f'if exist "{backup}" rmdir /S /Q "{backup}"',
         f'mkdir "{backup}"',
@@ -192,6 +192,22 @@ def write_apply_script(todo, base_dir, version):
     return script
 
 
+def clean_env():
+    """Environment for the relaunch helper.
+
+    A PyInstaller onefile app passes its extraction dir (_MEIPASS2 / _PYI_*) to child processes. The
+    relaunched launcher would then try to load python3xx.dll from the OLD instance's temp dir, which
+    is deleted when that instance exits ("Failed to load Python DLL"). Drop those variables and ask
+    the bootloader to start fresh.
+    """
+    env = dict(os.environ)
+    for k in list(env):
+        if k.startswith("_PYI_") or k == "_MEIPASS2":
+            del env[k]
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    return env
+
+
 def launch_apply_script(script):
     """Run the script hidden and independent of this process.
 
@@ -209,4 +225,5 @@ def launch_apply_script(script):
             stdin=subprocess.DEVNULL,
             stdout=lf,
             stderr=subprocess.STDOUT,
+            env=clean_env(),
         )

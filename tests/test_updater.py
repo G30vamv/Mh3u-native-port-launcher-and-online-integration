@@ -124,6 +124,19 @@ class UpdaterTests(unittest.TestCase):
         with open(os.path.join(base, "file.txt"), "rb") as f:
             self.assertEqual(f.read(), b"NEW")
 
+    def test_clean_env_drops_pyinstaller_state(self):
+        """Regression: the relaunched onefile exe inherited _MEIPASS2/_PYI_* and failed to load python3xx.dll."""
+        os.environ["_PYI_APPLICATION_HOME_DIR"] = "C:/old/_MEI123"
+        os.environ["_MEIPASS2"] = "C:/old/_MEI123"
+        try:
+            env = updater.clean_env()
+        finally:
+            del os.environ["_PYI_APPLICATION_HOME_DIR"]
+            del os.environ["_MEIPASS2"]
+        self.assertNotIn("_PYI_APPLICATION_HOME_DIR", env)
+        self.assertNotIn("_MEIPASS2", env)
+        self.assertEqual(env["PYINSTALLER_RESET_ENVIRONMENT"], "1")
+
 
 if __name__ == "__main__":
     unittest.main()
