@@ -20,7 +20,7 @@ Launcher gráfico para Windows del **port nativo de PC de Monster Hunter 3 Ultim
 
 ## Instalación
 
-1. Descarga `MH3U_Port_Launcher_vX.Y.Z.zip` desde [**Releases**](../../releases/latest) y descomprímelo en una carpeta con permisos de escritura (no `Program Files`).
+1. Descarga `MH3U_Port_Launcher_vX.Y.Z.zip` desde [**Releases**](../../releases/latest) (incluye todo lo necesario: launcher, motor del port y servidor online) y descomprímelo en una carpeta con permisos de escritura (no `Program Files`).
 2. Abre `MH3U.exe`, ve a **Instalación & Dump**, selecciona la carpeta de tu juego y pulsa **Traducir y Compilar** (solo la primera vez).
 3. Pulsa **JUGAR**.
 
@@ -46,13 +46,14 @@ python mh3u_launcher.py            # ejecutar sin empaquetar
 pyinstaller MH3U.spec              # generar MH3U.exe
 ```
 
-`mh3u-tools.exe` (motor del port) y `server.exe` (servidor NEX) son proyectos de terceros y no están en este repositorio; ver [`THIRD_PARTY.md`](THIRD_PARTY.md). Para publicar una versión nueva, ver [`docs/RELEASING.md`](docs/RELEASING.md).
+Los binarios `mh3u-tools.exe` (motor del port) y `server.exe` (servidor NEX) no se versionan aquí: viajan en los Releases. Su código fuente correspondiente está en [`source-patches/`](source-patches/) (parches sobre `glinesbdev/mh3u-port`) y en el repositorio de [mh3u-revival v0.2.0-beta](https://github.com/Matt-Wood-23/mh3u-revival/tree/v0.2.0-beta). Para publicar una versión nueva, ver [`docs/RELEASING.md`](docs/RELEASING.md).
 
 ## Estructura
 
 ```
 launcher/   Código del launcher (mh3u_launcher.py, updater.py), spec de PyInstaller y assets
-package/    Archivos que van junto a MH3U.exe en los Releases (guías, script de firewall)
+package/    Archivos que van junto a MH3U.exe en los Releases (guías, firewall, LICENSE, SOURCE, hooks)
+source-patches/  Código fuente correspondiente de mh3u-tools.exe (AGPL-3.0)
 tools/      make_release.py: genera manifest.json + zip de un Release
 tests/      Pruebas del actualizador
 docs/       Guía de publicación
@@ -67,4 +68,4 @@ docs/       Guía de publicación
 
 ## Licencia
 
-El código de este repositorio (`launcher/`, `tools/`) es [MIT](LICENSE). Los componentes de terceros conservan sus licencias: [`THIRD_PARTY.md`](THIRD_PARTY.md).
+Todo el proyecto se publica bajo **GNU AGPL-3.0-only** (ver [`LICENSE`](LICENSE)), la misma licencia que `mh3u-port` y `mh3u-revival`, por tratarse de un proyecto de preservación del videojuego. Los Releases incluyen `LICENSE.txt` y `SOURCE.txt` con los enlaces al código fuente de cada componente. La licencia no cubre el juego (© Capcom) ni las marcas de Capcom y Nintendo. Otros componentes: [`THIRD_PARTY.md`](THIRD_PARTY.md).

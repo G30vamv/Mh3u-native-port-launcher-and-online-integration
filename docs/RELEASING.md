@@ -15,7 +15,7 @@ python tools/make_release.py --version v0.8.0 --dir "<carpeta distribuible>" --o
 
 Genera en `dist-release/`: los archivos planos, `manifest.json` (SHA-256 y URLs) y `MH3U_Port_Launcher_v0.8.0.zip` para instalaciones nuevas. Falla si `--version` no coincide con `APP_VERSION`.
 
-- `server.exe` (Matt-Wood-23, AGPL) **no** se incluye salvo `--include-server`. Cámbialo solo cuando haya una versión nueva del servidor.
+- `server.exe` (mh3u-revival v0.2.0-beta, sin modificar) se incluye por defecto; `--no-server` lo omite. Si lo actualizas a otra versión, cambia el tag en `package/SOURCE.txt` y `THIRD_PARTY.md`.
 - Nunca se publican: `SI_WiiU_MonsterHunter3Ultimate.jpg`, `launcher_config.json`, `game.dll`, logs.
 
 ## 3. Publicar

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
 """Build the assets of a launcher release: flat files + manifest.json + first-install zip.
 
 Usage (from the repo root):
     python tools/make_release.py --version v0.8.0 --dir "<built launcher folder>" --out dist-release \
-        --notes "What changed" [--include-server]
+        --notes "What changed" [--no-server]
 
 <built launcher folder> is the distributable folder (MH3U.exe, mh3u-tools.exe, assets/, ...).
 Upload everything in --out to a GitHub Release tagged with the same version. The launcher reads
@@ -30,8 +31,12 @@ UPDATE_FILES = [
     "LEEME.txt",
     "INSTRUCCIONES_MULTIJUGADOR.txt",
     "WUA_EXTRACTION_GUIDE.txt",
+    "LICENSE.txt",
+    "SOURCE.txt",
+    "mods/hooks.txt",
+    "server.exe",
 ]
-UPDATE_DIRS = ["assets"]
+UPDATE_DIRS = ["assets"]  # + mods/hooks.txt above
 # Never published: Nintendo artwork, per-user data, builds and logs.
 NEVER = {
     "SI_WiiU_MonsterHunter3Ultimate.jpg",
@@ -41,7 +46,6 @@ NEVER = {
     "server.log",
     "mh3u_latest.log",
 }
-SERVER_EXE = "server.exe"  # third-party (Matt-Wood-23/mh3u-revival, AGPL-3.0): opt-in only
 
 
 def sha256(path):
@@ -52,10 +56,8 @@ def sha256(path):
     return h.hexdigest()
 
 
-def collect(src, include_server):
-    rels = [f for f in UPDATE_FILES if os.path.isfile(os.path.join(src, f))]
-    if include_server and os.path.isfile(os.path.join(src, SERVER_EXE)):
-        rels.append(SERVER_EXE)
+def collect(src, skip=()):
+    rels = [f for f in UPDATE_FILES if f not in skip and os.path.isfile(os.path.join(src, f))]
     for d in UPDATE_DIRS:
         for root, _, files in os.walk(os.path.join(src, d)):
             for name in files:
@@ -80,7 +82,7 @@ def main():
     ap.add_argument("--dir", required=True, help="built launcher folder")
     ap.add_argument("--out", default="dist-release")
     ap.add_argument("--notes", default="")
-    ap.add_argument("--include-server", action="store_true", help="also ship server.exe (third-party, AGPL-3.0)")
+    ap.add_argument("--no-server", action="store_true", help="leave server.exe out (unchanged third-party binary, mh3u-revival v0.2.0-beta)")
     args = ap.parse_args()
 
     found = launcher_version(args.dir)
@@ -89,7 +91,7 @@ def main():
     if not os.path.isfile(os.path.join(args.dir, "MH3U.exe")):
         sys.exit("MH3U.exe not found in --dir")
 
-    rels = collect(args.dir, args.include_server)
+    rels = collect(args.dir, ("server.exe",) if args.no_server else ())
     os.makedirs(args.out, exist_ok=True)
     base_url = f"https://github.com/{REPO}/releases/download/{args.version}/"
     entries = []
@@ -106,7 +108,7 @@ def main():
     zip_path = os.path.join(args.out, f"MH3U_Port_Launcher_{args.version}.zip")
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
         for rel in rels:
-            z.write(os.path.join(args.dir, *rel.split("/")), rel)
+            z.write(os.path.join(args.dir, *rel.split("/")), "MH3U_Port_Launcher/" + rel)
 
     print(f"{len(entries)} files, zip {os.path.getsize(zip_path) / 1048576:.1f} MB -> {args.out}")
     for e in entries:

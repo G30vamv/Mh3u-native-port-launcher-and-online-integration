@@ -1,0 +1,31 @@
+CODIGO FUENTE / SOURCE CODE  (GNU AGPL-3.0)
+============================================
+
+Este paquete se distribuye bajo la GNU Affero General Public License v3.0
+(ver LICENSE.txt). Codigo fuente correspondiente de cada componente:
+
+1) Launcher (MH3U.exe) + herramientas de release + parches de abajo
+   https://github.com/G30vamv/Mh3u-native-port-launcher-and-online-integration
+
+2) mh3u-tools.exe  (port nativo de glinesbdev/mh3u-port, con modificaciones)
+   Original : https://github.com/glinesbdev/mh3u-port  (commit base 1b32434)
+   Cambios  : carpeta source-patches/ del repositorio (1), parches 0001 y 0002,
+              con instrucciones para reproducir el binario.
+
+3) server.exe  (mh3u-revival de Matt-Wood-23, SIN modificar, version v0.2.0-beta)
+   https://github.com/Matt-Wood-23/mh3u-revival/tree/v0.2.0-beta
+
+4) mods/hooks.txt  (de glinesbdev/mh3u-port, sin modificar)
+
+5) libunwind.dll  (LLVM, Apache-2.0 con excepcion LLVM)
+   https://github.com/llvm/llvm-project
+
+Este paquete NO incluye ningun archivo de Monster Hunter 3 Ultimate.
+Necesitas tu propia copia legitima (Wii U, USA + update v32).
+Monster Hunter es marca de Capcom; Wii U, de Nintendo. Proyecto de fans sin afiliacion.
+
+---
+
+This package is distributed under the GNU Affero General Public License v3.0
+(see LICENSE.txt). The corresponding source of every component is linked above.
+It contains no game files; you must supply your own legally obtained dump.

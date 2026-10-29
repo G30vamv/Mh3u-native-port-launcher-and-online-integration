@@ -1,0 +1,40 @@
+# Translation-time hooks (docs/hooks.md): one `ADDRESS name` a line (hex, the `0x` is optional;
+# `in:ADDRESS name` hooks the function containing that address),
+# the entry of a guest function. The translated functions are named f_XXXXXXXX in the build's .h/.c files (f_02000020 is 0x02000020).
+# Re-run `mh3u-tools translate` (scripts/win-build.ps1) after editing; MH3U_HOOK_LOG=1 logs every call of each hook.
+# No real addresses yet (step 5 of the plan finds them). To try the mechanism, list any function the translator found, e.g. one
+# from an [enter] or [watch] log line, or an f_XXXXXXXX name in game.h:
+# 0x02000000 example
+
+# Confirmed in run 31 (docs/hooks.md, "Run 31"). r3 is the hunter's data (0x10 before the save block) in all of these.
+0x0219c720 money_add          # r4 = signed change in zenny (-200 craft fee, -50 meal, -310 quest fee, +310 refund), r5 = &money
+0x02199438 item_gain          # r5 = item id; destination by lr: 0x219b080 pouch, 0x2199574 / 0x219950c box (runs 30, 31, 33)
+0x0219ae84 pouch_remove_slot  # 1 call, putting a pouch item back in the box; r4 = r5 = the pouch
+0x02198d40 equip_records      # writes the records at +0x50..+0xbf after crafting armour; r5 = record kind (0x10..0x19)
+# The functions that call money_add at these return addresses (in: = the function containing the address; the translator prints
+# which f_ it is):
+in:0x022087d4 craft_jewel        # f_02208758, confirmed run 32 (fee -200)
+in:0x0220715c craft_equipment    # f_022070cc, confirmed run 32: armour (-300) and a Great Sword (-750); r4 = 7 both times
+in:0x0220c078 upgrade_equipment  # f_0220b93c, confirmed run 33 (r4 = 5, fee -4000)
+in:0x021e3724 quest_accept       # f_021e355c, confirmed run 32; r4 = the quest's data, r5 = the quest's number (0x4b2, 0x450)
+in:0x02172ca4 quest_end          # f_0217242c, confirmed run 32 on abandon and on completion (r4 = 1 both times)
+# in:0x021794c8 quest_fee_back   # run 32 only (+200 before quest_end); did not fire in run 33's quest: off for now
+in:0x0217f12c quest_reward       # f_0217ef68, confirmed run 33: twice on the reward screen (r5 = 1, then 5), then +1000
+# in:0x0217f5b0 quest_reward_items # run 32 only (10 small payments); not in run 33: off for now
+# The callers of item_gain, by where the item goes (run 33's lr rule; not confirmed as hooks yet, and maybe shared code):
+in:0x0219950c item_to_box
+in:0x0219b080 item_to_pouch      # f_0219aeac(save, item, count): count -1 = an item used (run 39, twice, from lr 0x285edac, f_0285ecd4); the overlay's item_use
+# Rejected (thousands of calls a minute, queries, not actions): 0x0219acec (pouch item lookup, r4 = item id),
+# 0x02199408 (box item lookup, r4 = item id), 0x02198770 (field getter, r5 = 7/8), 0x0216afd4 (per-frame, another object).
+0x02037600 menu_page          # f_02037600(menu, page, 1): r4 = 3 once per item-menu open (runs 41, 42 confirmed; lr 0x2662a74); r4 = 0 on other menu changes
+0x02153480 menu_open          # r5 = -1 (lr 0x21546fc) once per menu open, item or main (run 41: 3 opens, 3 calls; confirmed run 42); other r5 values are not opens
+0x02aff91c text_set           # f_02aff91c(pane, text, length): the layout sets a text box (Ghidra); MH3U_NATIVE_TEXT swaps the item menu empty-slot call (lr 0x2660e68); MH3U_NATIVE_MENU sets the Mods page's rows on the same call
+0x02152c48 menu_start         # f_02152c48(menu, open, kind): the start menu's open path (Ghidra); S = menu + 0x34. MH3U_MENU_PROBE logs S
+0x02154abc menu_update        # f_02154abc(menu, S): the start menu's update while it is up (Ghidra). MH3U_MENU_PROBE logs S on change; MH3U_NATIVE_MENU keeps A from Gestures while the mod key is held
+0x02152874 menu_rows          # f_02152874(menu, S, cursor): marks the selected row, right after f_0215249c refills the rows (Ghidra). MH3U_NATIVE_MENU sets the Gestures label here
+0x02234218 combo_update       # f_02234218(menu, S): the Combo List page's update (Ghidra; from f_02153eb4 when S+0x1e = 2). MH3U_NATIVE_MENU borrows the page as the Mods page
+0x0265bfac combo_panel        # f_0265bfac(panel, S): the Combo List's side panel (Ghidra; from f_026636d4). MH3U_NATIVE_MENU keeps the panel object to tell its panes apart
+0x02144d18 help_set           # f_02144d18(ui, text, 0): sets the help line (Ghidra). MH3U_NATIVE_MENU swaps the Combo List's (lr 0x2663c50) on the Mods page
+0x02144998 help_set_alt       # f_02144998(ui, text): the help line's other setter (Ghidra; f_026636d4 takes it when S+0x18 is set, lr 0x2663c34). MH3U_NATIVE_MENU swaps it on the Mods page
+0x02af349c vis_set            # f_02af349c(pane, shown): a layout pane's visibility (Ghidra). MH3U_NATIVE_MENU keeps the Combo List's description box shown on the Mods page
+0x0262115c guide_set          # f_0262115c(guide, mode): the button hints (Ghidra; from f_0265b148, modes 0x22-0x25 for the Combo List). MH3U_NATIVE_MENU sets mode 0 (none) on the Mods page

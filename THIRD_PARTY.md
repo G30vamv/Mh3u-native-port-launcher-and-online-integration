@@ -1,12 +1,13 @@
 # Componentes de terceros
 
-Este repositorio **no contiene** código de terceros ni archivos del juego. Los lanzamientos (Releases) distribuyen o descargan los siguientes componentes, cada uno bajo su propia licencia:
+Este proyecto es AGPL-3.0-only. Los Releases incluyen o descargan los siguientes componentes de terceros, cada uno con su licencia. El repositorio no contiene archivos del juego.
 
 | Componente | Autor | Licencia | Uso |
 |---|---|---|---|
 | [mh3u-port](https://github.com/glinesbdev/mh3u-port) | glinesbdev | AGPL-3.0 | Traductor/runtime del port nativo. `mh3u-tools.exe` de los Releases es una compilación con modificaciones propias (rendimiento y red online); su código fuente correspondiente debe estar disponible según la AGPL (ver `source-patches/`). |
-| [mh3u-revival](https://github.com/Matt-Wood-23/mh3u-revival) | Matt-Wood-23 | AGPL-3.0 | Servidor NEX (`server.exe`), sin modificaciones. |
+| [mh3u-revival](https://github.com/Matt-Wood-23/mh3u-revival) | Matt-Wood-23 | AGPL-3.0 | Servidor NEX (`server.exe`), **sin modificar**, versión v0.2.0-beta (idéntico byte a byte al `server.exe` de su `MH3U_Online_Bundle.zip`, SHA-256 `6c447a013f3d…`). Fuente: <https://github.com/Matt-Wood-23/mh3u-revival/tree/v0.2.0-beta>. |
 | [llvm-mingw](https://github.com/mstorsjo/llvm-mingw) | Martin Storsjö | Apache-2.0 con excepción LLVM / MIT | Compilador Clang portátil que el launcher descarga bajo demanda. |
+| LLVM `libunwind.dll` | LLVM Project | Apache-2.0 con excepción LLVM | Runtime requerido por `mh3u-tools.exe`. |
 | [CustomTkinter](https://github.com/TomSchimansky/CustomTkinter) | Tom Schimansky | MIT | Interfaz del launcher. |
 | [Pillow](https://python-pillow.org/) | Pillow contributors | HPND | Manejo de imágenes. |
 | [PyInstaller](https://pyinstaller.org/) | PyInstaller team | GPL-2.0 con excepción de bootloader | Empaquetado de `MH3U.exe`. |
