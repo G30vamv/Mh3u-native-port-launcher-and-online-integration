@@ -755,16 +755,16 @@ class MH3ULauncherApp(ctk.CTk):
         )
         btn_open_save.grid(row=3, column=0, padx=15, pady=5, sticky="ew")
 
-        ctk.CTkLabel(quick_right, text="Teclado y Ratón (si juegas sin mando):").grid(
+        ctk.CTkLabel(quick_right, text="¿Juegas con mando o teclado?").grid(
             row=4, column=0, padx=15, pady=(8, 2), sticky="w"
         )
         self.opt_keyboard = ctk.CTkSegmentedButton(
             quick_right,
-            values=["Activado", "Desactivado"],
+            values=["Mando", "Teclado"],
             command=self.on_keyboard_changed,
         )
         self.opt_keyboard.grid(row=5, column=0, padx=15, pady=(0, 12), sticky="ew")
-        self.opt_keyboard.set("Activado" if self.config.get("keyboard_controls", True) else "Desactivado")
+        self.opt_keyboard.set("Teclado" if self.config.get("keyboard_controls", True) else "Mando")
 
         # Gameplay Tip Card
         tip_card = ctk.CTkFrame(self.tab_main, corner_radius=10, fg_color="#0d1820", border_width=1, border_color="#2b4a58")
@@ -1677,7 +1677,7 @@ class MH3ULauncherApp(ctk.CTk):
         self.lbl_quick_pad.configure(text=f"Mando: Disposición {'Xbox' if self.config['pad_layout'] == 'xbox' else 'Nintendo'}")
 
     def on_keyboard_changed(self, value):
-        self.config["keyboard_controls"] = value == "Activado"
+        self.config["keyboard_controls"] = value == "Teclado"  # Teclado = keyboard + mouse capture on
         self.save_config()
 
     def on_backend_changed(self, value):

@@ -44,5 +44,6 @@ CONSEJO IMPORTANTE:
 
 ¡Buena caza!
 
-- Teclado y ratón: en la pantalla principal, sección 'Acciones Frecuentes', el selector
-  'Teclado y Ratón' los activa (por defecto) o desactiva si juegas solo con mando.
+- Mando o teclado: en la pantalla principal, sección 'Acciones Frecuentes', elige
+  '¿Juegas con mando o teclado?'. 'Teclado' activa teclado y ratón (por defecto);
+  'Mando' los desactiva para que la ventana no capture el cursor.
