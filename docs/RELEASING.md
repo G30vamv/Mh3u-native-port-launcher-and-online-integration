@@ -7,20 +7,28 @@
 3. Reconstruye `MH3U.exe` (`pyinstaller MH3U.spec`) y deja la carpeta distribuible completa (`MH3U.exe`, `mh3u-tools.exe`, `libunwind.dll`, `assets/`, archivos de `package/`).
 4. Prueba en esa carpeta antes de publicar (regla del proyecto: probar antes de subir versión).
 
-## 2. Generar los archivos del Release
+## 2. Publicar (un solo zip)
 
 ```powershell
-python tools/make_release.py --version v0.8.0 --dir "<carpeta distribuible>" --out dist-release --notes "Qué cambia"
+python tools/publish_release.py --version v0.8.3 --dir "<carpeta distribuible>" --title "v0.8.3 - Título corto" --notes-file notas.md
 ```
 
-Genera en `dist-release/`: los archivos planos, `manifest.json` (SHA-256 y URLs) y `MH3U_Port_Launcher_v0.8.0.zip` para instalaciones nuevas. Falla si `--version` no coincide con `APP_VERSION`.
+Requiere `gh` autenticado. `--dry-run` solo construye el zip; `--replace` reemplaza los archivos de un release ya existente.
 
-- `server.exe` (mh3u-revival v0.2.0-beta, sin modificar) se incluye por defecto; `--no-server` lo omite. Si lo actualizas a otra versión, cambia el tag en `package/SOURCE.txt` y `THIRD_PARTY.md`.
+**Regla:** la página del Release muestra **solo `MH3U_Port_Launcher_<versión>.zip`** (todo lo necesario para que funcione: launcher, `mh3u-tools.exe`, `server.exe`, `libunwind.dll`, assets, guías, `LICENSE.txt`, `SOURCE.txt`, `mods/hooks.txt`), más un `manifest.json` diminuto que solo lee el actualizador y que solo conserva el último release. Las notas deben decir "descarga solo el zip".
+
+El script:
+1. Construye el zip (carpeta `MH3U_Port_Launcher/`) y calcula el SHA-256 de cada archivo.
+2. Sube los archivos individuales a la rama `updates` (commit inmutable, tag `files-<versión>`); el actualizador baja de ahí solo lo que cambió, con URLs fijadas al commit (sin caché obsoleta).
+3. Crea el Release con el zip y el `manifest.json`, y deja solo el zip en los releases anteriores.
+
+- `server.exe` (mh3u-revival v0.2.0-beta, sin modificar) se incluye por defecto; `--no-server` lo omite. Si lo actualizas, cambia el tag en `package/SOURCE.txt` y `THIRD_PARTY.md`.
 - Nunca se publican: `SI_WiiU_MonsterHunter3Ultimate.jpg`, `launcher_config.json`, `game.dll`, logs.
+- Si cambias algo ya publicado, mejor sube una versión nueva: los usuarios que ya la tienen no recibirían el cambio.
 
-## 3. Publicar
+## 3. Publicado el Release
 
-Crea un Release con el tag `v0.8.0` y sube **todo** el contenido de `dist-release/` (el launcher lee `releases/latest/download/manifest.json`, así que el Release debe ser el "latest", no un pre-release ni borrador).
+El launcher lee `releases/latest/download/manifest.json`, así que el Release debe ser el "latest" (no pre-release ni borrador). `tools/make_release.py` queda como utilidad para generar los archivos sin publicar.
 
 ## 4. Verificar
 
