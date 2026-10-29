@@ -51,7 +51,12 @@ _TH["CTkComboBox"].update({"button_color": ["#3b6073", "#3b6073"], "button_hover
 _TH["CTkEntry"].update({"fg_color": ["#fff6e0", "#0d1820"], "border_color": ["#b9a97f", "#2b4a58"]})
 _TH["CTkScrollbar"].update({"button_color": ["#3b6073", "#3b6073"], "button_hover_color": ["#c98f2b", "#c98f2b"]})
 
-APP_VERSION = "v0.8.1"
+APP_VERSION = "v0.8.2"
+
+# Header update widget colors (state -> label color) and button looks: (fg, hover)
+UPDATE_COLORS = {"info": "#9db3ba", "ok": "#7fcfa6", "warn": "#eab84c", "error": "#e07a6f"}
+UPDATE_BTN_IDLE = ("#2f9488", "#257a70")
+UPDATE_BTN_READY = ("#b8791e", "#d4922a")
 
 # Bump when the translator output changes (e.g. more functions discovered). A game.dll built
 # by an older translator lacks functions the online code needs ("not a translated function").
@@ -616,12 +621,30 @@ class MH3ULauncherApp(ctk.CTk):
             text_color="#eab84c",
         ).pack(padx=14, pady=(6, 1))
 
-        ctk.CTkLabel(
-            dev_badge,
-            text="g30wolff99",
-            font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
-            text_color="#4fc3d6",
-        ).pack(padx=14, pady=(0, 6))
+        if updater:
+            self.btn_update = ctk.CTkButton(
+                dev_badge,
+                text="⟳  Buscar actualizaciones",
+                width=190,
+                height=28,
+                corner_radius=14,
+                font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+                fg_color=UPDATE_BTN_IDLE[0],
+                hover_color=UPDATE_BTN_IDLE[1],
+                command=self.on_update_button,
+            )
+            self.btn_update.pack(padx=14, pady=(2, 2))
+            self.lbl_update_status = ctk.CTkLabel(
+                dev_badge,
+                text="",
+                width=190,
+                wraplength=190,
+                font=ctk.CTkFont(family="Segoe UI", size=11),
+                text_color=UPDATE_COLORS["info"],
+            )
+            self.lbl_update_status.pack(padx=14, pady=(0, 7))
+        else:
+            ctk.CTkFrame(dev_badge, fg_color="transparent", height=4).pack()
 
     def create_footer(self):
         footer_frame = ctk.CTkFrame(self, fg_color="transparent")
@@ -1525,51 +1548,67 @@ class MH3ULauncherApp(ctk.CTk):
             text_color="#eab84c",
         ).grid(row=4, column=1, padx=10, pady=5, sticky="w")
 
-        # Remote updates
-        if updater:
-            ctk.CTkLabel(
-                credits_card,
-                text="Actualizaciones:",
-                font=ctk.CTkFont(weight="bold", size=13),
-                text_color="#4fc3d6",
-            ).grid(row=5, column=0, padx=15, pady=(5, 12), sticky="w")
-            upd_frame = ctk.CTkFrame(credits_card, fg_color="transparent")
-            upd_frame.grid(row=5, column=1, padx=10, pady=(5, 12), sticky="w")
-            self.btn_update = ctk.CTkButton(
-                upd_frame, text="Buscar actualizaciones", height=26, command=lambda: self.check_for_updates(silent=False)
-            )
-            self.btn_update.pack(side="left")
-            self.lbl_update_status = ctk.CTkLabel(upd_frame, text="", font=ctk.CTkFont(size=12), text_color="#e3d8bd")
-            self.lbl_update_status.pack(side="left", padx=10)
+    # =========================================================================
+    # REMOTE UPDATES (header widget: button + status line)
+    # =========================================================================
+    def _set_update_status(self, text, kind="info"):
+        self.ui_queue.put(("update_state", {"text": text, "text_color": UPDATE_COLORS[kind]}))
 
-    # =========================================================================
-    # REMOTE UPDATES
-    # =========================================================================
+    def _set_update_button(self, **kw):
+        self.ui_queue.put(("update_btn", kw))
+
+    def on_update_button(self):
+        """Header button: checks for updates, or re-opens the pending update prompt."""
+        pending = getattr(self, "_pending_update", None)
+        if pending:
+            self._prompt_update(*pending)
+        else:
+            self.check_for_updates(silent=False)
+
     def check_for_updates(self, silent=False):
         if not updater or getattr(self, "_update_busy", False):
             return
         self._update_busy = True
-        self.ui_queue.put(("update_btn", {"state": "disabled"}))
-        self.ui_queue.put(("update_state", {"text": "Buscando..."}))
+        self._set_update_button(state="disabled", text="⟳  Buscando...")
+        self._set_update_status("Comprobando versión...", "info")
+
+        def idle():
+            self._update_busy = False
+            self._set_update_button(
+                state="normal", text="⟳  Buscar actualizaciones", fg_color=UPDATE_BTN_IDLE[0], hover_color=UPDATE_BTN_IDLE[1]
+            )
 
         def worker():
             try:
                 manifest = updater.fetch_manifest()
                 if not updater.is_newer(manifest, APP_VERSION):
-                    self.ui_queue.put(("update_state", {"text": f"Estás al día ({APP_VERSION})"}))
-                    self._update_busy = False
-                    self.ui_queue.put(("update_btn", {"state": "normal"}))
+                    self._pending_update = None
+                    idle()
+                    self._set_update_status(f"✔ Estás al día ({APP_VERSION})", "ok")
                     return
                 todo = updater.files_to_update(manifest, get_base_dir())
+                if not todo:
+                    self._pending_update = None
+                    idle()
+                    self._set_update_status("✔ Archivos al día", "ok")
+                    return
+                self._pending_update = (manifest, todo)
                 self._update_busy = False
-                self.ui_queue.put(("update_btn", {"state": "normal"}))
-                self.ui_queue.put(("update_state", {"text": f"Disponible: {manifest['version']}"}))
-                if not silent or todo:
+                self._set_update_button(
+                    state="normal",
+                    text=f"⬆  Actualizar a {manifest['version']}",
+                    fg_color=UPDATE_BTN_READY[0],
+                    hover_color=UPDATE_BTN_READY[1],
+                )
+                self._set_update_status(f"Nueva versión {manifest['version']} disponible", "warn")
+                if not silent:
                     self.ui_queue.put(("update_prompt", (manifest, todo)))
             except Exception as e:
-                self._update_busy = False
-                self.ui_queue.put(("update_btn", {"state": "normal"}))
-                self.ui_queue.put(("update_state", {"text": "Sin conexión" if silent else f"Error: {e}"}))
+                idle()
+                if silent:
+                    self._set_update_status("Sin conexión con GitHub", "info")
+                else:
+                    self._set_update_status(f"No se pudo comprobar: {e}", "error")
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1585,27 +1624,26 @@ class MH3ULauncherApp(ctk.CTk):
         if self.is_running or self.is_compiling:
             messagebox.showwarning("Actualización", "Cierra el juego y espera a que termine la compilación antes de actualizar.")
             return
-        if not todo:
-            messagebox.showinfo("Actualización", "Los archivos ya están al día.")
-            return
         if not messagebox.askyesno("Actualización disponible", msg):
             return
         self._update_busy = True
-        self.ui_queue.put(("update_btn", {"state": "disabled"}))
+        self._set_update_button(state="disabled", text="⬇  Descargando...")
 
         def worker():
             try:
                 def progress(frac, name):
-                    self.ui_queue.put(("update_state", {"text": f"Descargando {name} ({int(frac * 100)}%)"}))
+                    self._set_update_status(f"Descargando {name} ({int(frac * 100)}%)", "info")
 
                 updater.download_files(todo, get_base_dir(), progress)
                 script = updater.write_apply_script(todo, get_base_dir(), manifest["version"])
-                self.ui_queue.put(("update_state", {"text": "Aplicando... el launcher se reiniciará"}))
+                self._set_update_status("Aplicando... el launcher se reiniciará", "ok")
                 self.after(0, lambda: self._finish_update(script))
             except Exception as e:
                 self._update_busy = False
-                self.ui_queue.put(("update_btn", {"state": "normal"}))
-                self.ui_queue.put(("update_state", {"text": "Falló la actualización"}))
+                self._set_update_button(
+                    state="normal", text=f"⬆  Actualizar a {manifest['version']}", fg_color=UPDATE_BTN_READY[0], hover_color=UPDATE_BTN_READY[1]
+                )
+                self._set_update_status("Falló la actualización", "error")
                 self.ui_queue.put(("error", ("Actualización", f"No se pudo actualizar (no se modificó nada):\n{e}")))
 
         threading.Thread(target=worker, daemon=True).start()
