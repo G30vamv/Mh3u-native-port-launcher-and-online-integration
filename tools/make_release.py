@@ -67,6 +67,15 @@ def collect(src, skip=()):
     return rels
 
 
+def build_zip(src, rels, version, out):
+    """First-install zip: everything the launcher needs, inside MH3U_Port_Launcher/."""
+    zip_path = os.path.join(out, f"MH3U_Port_Launcher_{version}.zip")
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+        for rel in rels:
+            z.write(os.path.join(src, *rel.split("/")), "MH3U_Port_Launcher/" + rel)
+    return zip_path
+
+
 def launcher_version(src):
     for candidate in (os.path.join(src, "mh3u_launcher.py"), os.path.join(os.path.dirname(__file__), "..", "launcher", "mh3u_launcher.py")):
         if os.path.isfile(candidate):
@@ -105,10 +114,7 @@ def main():
     with open(os.path.join(args.out, "manifest.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, ensure_ascii=False)
 
-    zip_path = os.path.join(args.out, f"MH3U_Port_Launcher_{args.version}.zip")
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
-        for rel in rels:
-            z.write(os.path.join(args.dir, *rel.split("/")), "MH3U_Port_Launcher/" + rel)
+    zip_path = build_zip(args.dir, rels, args.version, args.out)
 
     print(f"{len(entries)} files, zip {os.path.getsize(zip_path) / 1048576:.1f} MB -> {args.out}")
     for e in entries:

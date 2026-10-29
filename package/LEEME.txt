@@ -6,7 +6,7 @@
 ¡Bienvenido al launcher oficial de Monster Hunter 3 Ultimate para PC!
 
 Este paquete es 100% PORTABLE y AUTÓNOMO (funciona directamente al descomprimir):
-- Compilador Clang/LLD portátil (toolchain local) preinstalado.
+- Clang/LLD portátil: el launcher lo descarga una sola vez (~140 MB) con un clic cuando lo necesites.
 - Soporte de escalado AMD FidelityFX FSR 1.0 y AMD CAS integrado en Vulkan/DirectX 12.
 - Soporte para optimización inter-archivos ThinLTO (-flto=thin + -O3).
 - Motor nativo 'mh3u-tools.exe' optimizado con contador de FPS e interfaz fluida.
@@ -20,7 +20,7 @@ PASOS RÁPIDOS PARA JUGAR (SOLO LA PRIMERA VEZ):
    - Si tienes tu carpeta con el juego base (0005000010118300) y la
      actualización v32 (0005000e10118300), pulsa "Examinar..." y selecciónala.
      (El launcher detectará automáticamente ambos dumps y los marcará en verde).
-   - Verás el compilador Clang marcado en VERDE (Portátil incluido).
+   - Si Clang aparece en rojo, pulsa 'Descargar Clang Portátil' (o acepta la descarga al compilar).
    - Puedes activar la opción "🚀 Optimización LTO" para obtener el máximo
      rendimiento de CPU y estabilidad de fotogramas en tu procesador.
 3. Haz clic en el botón naranja:
