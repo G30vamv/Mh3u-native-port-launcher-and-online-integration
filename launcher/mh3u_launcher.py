@@ -51,7 +51,7 @@ _TH["CTkComboBox"].update({"button_color": ["#3b6073", "#3b6073"], "button_hover
 _TH["CTkEntry"].update({"fg_color": ["#fff6e0", "#0d1820"], "border_color": ["#b9a97f", "#2b4a58"]})
 _TH["CTkScrollbar"].update({"button_color": ["#3b6073", "#3b6073"], "button_hover_color": ["#c98f2b", "#c98f2b"]})
 
-APP_VERSION = "v0.8.0"
+APP_VERSION = "v0.8.1"
 
 # Bump when the translator output changes (e.g. more functions discovered). A game.dll built
 # by an older translator lacks functions the online code needs ("not a translated function").
@@ -455,6 +455,7 @@ class MH3ULauncherApp(ctk.CTk):
             "overlay": True,
             "native_menu": True,
             "native_text": True,
+            "keyboard_controls": True,
             "fps": False,
             "audio": True,
             "audio_fx": True,
@@ -753,6 +754,17 @@ class MH3ULauncherApp(ctk.CTk):
             command=self.open_save_folder,
         )
         btn_open_save.grid(row=3, column=0, padx=15, pady=5, sticky="ew")
+
+        ctk.CTkLabel(quick_right, text="Teclado y Ratón (si juegas sin mando):").grid(
+            row=4, column=0, padx=15, pady=(8, 2), sticky="w"
+        )
+        self.opt_keyboard = ctk.CTkSegmentedButton(
+            quick_right,
+            values=["Activado", "Desactivado"],
+            command=self.on_keyboard_changed,
+        )
+        self.opt_keyboard.grid(row=5, column=0, padx=15, pady=(0, 12), sticky="ew")
+        self.opt_keyboard.set("Activado" if self.config.get("keyboard_controls", True) else "Desactivado")
 
         # Gameplay Tip Card
         tip_card = ctk.CTkFrame(self.tab_main, corner_radius=10, fg_color="#0d1820", border_width=1, border_color="#2b4a58")
@@ -1663,6 +1675,10 @@ class MH3ULauncherApp(ctk.CTk):
         self.config["pad_layout"] = "xbox" if "Xbox" in value else "nintendo"
         self.save_config()
         self.lbl_quick_pad.configure(text=f"Mando: Disposición {'Xbox' if self.config['pad_layout'] == 'xbox' else 'Nintendo'}")
+
+    def on_keyboard_changed(self, value):
+        self.config["keyboard_controls"] = value == "Activado"
+        self.save_config()
 
     def on_backend_changed(self, value):
         self.config["gfx_backend"] = "dx12" if "DirectX" in value else "vulkan"
@@ -2640,6 +2656,8 @@ class MH3ULauncherApp(ctk.CTk):
             env["MH3U_NATIVE_MENU"] = "1"
         if self.config.get("native_text"):
             env["MH3U_NATIVE_TEXT"] = "1"
+        if self.config.get("keyboard_controls", True):
+            env["MH3U_KEYBOARD_CONTROLS"] = "1"
         if self.config.get("fps"):
             env["MH3U_FPS"] = "1"
         # Only turn off overlay if BOTH overlay and fps are false, as FPS counter is drawn in overlay

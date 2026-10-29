@@ -2,7 +2,7 @@
 
 `mh3u-tools.exe` de los Releases se compila a partir de [glinesbdev/mh3u-port](https://github.com/glinesbdev/mh3u-port) (AGPL-3.0) más los cambios de estos parches. Los parches están bajo **AGPL-3.0**, igual que el proyecto original.
 
-- **Base:** commit `1b32434` de `glinesbdev/mh3u-port` (14-oct-2026, *Merge pull request #30*).
+- **Base:** commit `41d3a9b` de `glinesbdev/mh3u-port` (26-oct-2026, *Merge pull request #34*).
 - **Orden de aplicación:** `0001` y `0002` son independientes entre sí.
 
 | Parche | Contenido |
@@ -15,10 +15,10 @@
 ```powershell
 git clone https://github.com/glinesbdev/mh3u-port.git
 cd mh3u-port
-git checkout 1b32434
+git checkout 41d3a9b
 git apply --ignore-whitespace <ruta>/0001-gfx-and-build-performance.patch
 git apply --ignore-whitespace <ruta>/0002-runtime-online-and-translator.patch
 cargo build --release -p mh3u-tools
 ```
 
-Verificado: ambos parches aplican limpios sobre `1b32434`. No se ha verificado el build en un clon limpio ni los checks (`fmt`, `clippy`) del proyecto original.
+Verificado: ambos parches aplican limpios sobre `41d3a9b`. No se ha verificado el build en un clon limpio ni los checks (`fmt`, `clippy`) del proyecto original.

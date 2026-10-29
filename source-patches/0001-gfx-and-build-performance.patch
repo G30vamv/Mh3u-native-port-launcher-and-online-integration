@@ -395,7 +395,7 @@ index 1ce1560..0a44513 100644
                      }
                  }
 diff --git a/crates/mh3u-gfx/src/lib.rs b/crates/mh3u-gfx/src/lib.rs
-index ddf9ffa..d767576 100644
+index b64aff0..e392ee2 100644
 --- a/crates/mh3u-gfx/src/lib.rs
 +++ b/crates/mh3u-gfx/src/lib.rs
 @@ -5,6 +5,7 @@ mod draw;
@@ -442,7 +442,7 @@ index ddf9ffa..d767576 100644
          }
      }
 diff --git a/crates/mh3u-gfx/src/overlay.rs b/crates/mh3u-gfx/src/overlay.rs
-index 722f6ec..6f0ff4b 100644
+index f9f6d5d..760f166 100644
 --- a/crates/mh3u-gfx/src/overlay.rs
 +++ b/crates/mh3u-gfx/src/overlay.rs
 @@ -126,6 +126,12 @@ pub struct Overlay {

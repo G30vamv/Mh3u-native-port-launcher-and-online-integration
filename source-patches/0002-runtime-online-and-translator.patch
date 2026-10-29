@@ -22,7 +22,7 @@ index 26efb42..65bdbb0 100644
              if inside(t) {
                  set.insert(t);
 diff --git a/crates/mh3u-rt/src/cafe.rs b/crates/mh3u-rt/src/cafe.rs
-index f81ceff..e788a3b 100644
+index 5304032..74a4728 100644
 --- a/crates/mh3u-rt/src/cafe.rs
 +++ b/crates/mh3u-rt/src/cafe.rs
 @@ -25,7 +25,8 @@ pub fn find(name: &str) -> Option<Handler> {

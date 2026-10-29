@@ -8,7 +8,7 @@ Este paquete se distribuye bajo la GNU Affero General Public License v3.0
    https://github.com/G30vamv/Mh3u-native-port-launcher-and-online-integration
 
 2) mh3u-tools.exe  (port nativo de glinesbdev/mh3u-port, con modificaciones)
-   Original : https://github.com/glinesbdev/mh3u-port  (commit base 1b32434)
+   Original : https://github.com/glinesbdev/mh3u-port  (commit base 41d3a9b)
    Cambios  : carpeta source-patches/ del repositorio (1), parches 0001 y 0002,
               con instrucciones para reproducir el binario.
 
