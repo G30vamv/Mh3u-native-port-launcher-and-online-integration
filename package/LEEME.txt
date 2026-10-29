@@ -1,0 +1,45 @@
+﻿============================================================
+  MONSTER HUNTER 3 ULTIMATE - PORT NATIVO DE PC (v0.7.7)
+  Launcher desarrollado por: g30wolff99
+============================================================
+
+¡Bienvenido al launcher oficial de Monster Hunter 3 Ultimate para PC!
+
+Este paquete es 100% PORTABLE y AUTÓNOMO (funciona directamente al descomprimir):
+- Compilador Clang/LLD portátil (toolchain local) preinstalado.
+- Soporte de escalado AMD FidelityFX FSR 1.0 y AMD CAS integrado en Vulkan/DirectX 12.
+- Soporte para optimización inter-archivos ThinLTO (-flto=thin + -O3).
+- Motor nativo 'mh3u-tools.exe' optimizado con contador de FPS e interfaz fluida.
+- Launcher gráfico oficial v0.7.7 con registro en tiempo real escroleable.
+
+------------------------------------------------------------
+PASOS RÁPIDOS PARA JUGAR (SOLO LA PRIMERA VEZ):
+------------------------------------------------------------
+1. Abre "MH3U.exe".
+2. Ve a la pestaña "🛠️ Instalación & Dump":
+   - Si tienes tu carpeta con el juego base (0005000010118300) y la
+     actualización v32 (0005000e10118300), pulsa "Examinar..." y selecciónala.
+     (El launcher detectará automáticamente ambos dumps y los marcará en verde).
+   - Verás el compilador Clang marcado en VERDE (Portátil incluido).
+   - Puedes activar la opción "🚀 Optimización LTO" para obtener el máximo
+     rendimiento de CPU y estabilidad de fotogramas en tu procesador.
+3. Haz clic en el botón naranja:
+   "🚀 Traducir y Compilar Port (Crear game.dll)"
+   - El launcher traducirá el juego y compilará los archivos nativos
+     en paralelo con tu procesador.
+   - Verás la barra de progreso y el contador de archivos avanzar en vivo.
+   - (Este paso toma aprox. 1 a 2 minutos y solo se hace UNA VEZ).
+4. En "🎨 Configuración Gráfica":
+   - Puedes configurar resolución nativa (1x, 2x 1440p, 4K),
+     el escalador AMD FSR 1.0 o AMD CAS, y el nivel de nitidez.
+5. ¡Listo! Pulsa en "🎮 JUGAR".
+
+------------------------------------------------------------
+CONSEJO IMPORTANTE:
+------------------------------------------------------------
+- Para jugar en solitario las misiones de la taberna de Tanzia (Rango Alto y G),
+  habla con el marinero y selecciona:
+  "Puerto Tanzia -> Individual -> Marina o Taberna".
+  No selecciones "Multijugador" si no estás conectado a una sala de red.
+
+¡Buena caza!

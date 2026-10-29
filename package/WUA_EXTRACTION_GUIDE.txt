@@ -1,0 +1,163 @@
+================================================================================
+  GUIA DE EXTRACCION DE ARCHIVOS .WUA / .WUA EXTRACTION GUIDE
+  Monster Hunter 3 Ultimate - PC Native Port (mh3u-port)
+================================================================================
+
+================================================================================
+  [ES] AVISO LEGAL IMPORTANTE / LEGAL DISCLAIMER
+================================================================================
+Este proyecto es un port nativo de PC de codigo abierto mediante recompilacion
+estatica. NO INCLUYE, NO DISTRIBUYE NI FACILITA ningun archivo protegido por
+derechos de autor, codigo ejecutable, graficos ni sonido del juego original.
+
+Para utilizar este port, el usuario DEBE poseer una copia legitima de Monster
+Hunter 3 Ultimate para Wii U (version USA) adquirida legalmente (en disco fisico
+o compra digital en Nintendo eShop) y haber extraido sus propios archivos ("dump")
+directamente desde su propia consola Wii U. Queda bajo la exclusiva responsabilidad
+del usuario utilizar unicamente copias de su propiedad legal.
+
+================================================================================
+  [EN] IMPORTANT LEGAL DISCLAIMER
+================================================================================
+This project is an open-source native PC port made via static recompilation.
+It DOES NOT INCLUDE, DISTRIBUTE, OR PROVIDE any copyrighted files, executable
+code, game assets, textures, or audio from the original game.
+
+To use this port, you MUST own a legitimate copy of Monster Hunter 3 Ultimate
+for Nintendo Wii U (USA release), legally purchased (physical disc or eShop),
+and dumped directly from your own console using homebrew tools. It is the sole
+responsibility of the user to ensure they are using their own legally dumped files.
+
+
+================================================================================
+  [ES] ¿POR QUE ES NECESARIO DESCOMPRIMIR EL ARCHIVO .WUA?
+================================================================================
+El formato .wua (Wii U Archive) es un contenedor comprimido utilizado por el
+emulador Cemu que empaqueta el juego base y su actualizacion en un unico archivo.
+
+El port nativo de PC de MH3U NO ES UN EMULADOR, sino un ejecutable nativo de Windows.
+Por ello, necesita acceder directamente a las carpetas originales desencriptadas del
+juego con la estructura estandar de Wii U:
+  - code/    (contiene el ejecutable del juego .rpx)
+  - content/ (contiene los datos, modelos, mapas y texturas)
+  - meta/    (contiene meta.xml y los iconos del juego)
+
+
+================================================================================
+  [ES] GUIA PASO A PASO PARA EXTRAER TU .WUA
+================================================================================
+
+REQUISITOS:
+  - Tu archivo .wua de Monster Hunter 3 Ultimate (Version USA con Update v32).
+  - La herramienta oficial de descompresion ZArchive creada por Exzap (autor de Cemu).
+
+PASO 1: Descargar la herramienta oficial ZArchive
+  1. Abre tu navegador web y visita la pagina oficial de lanzamientos en GitHub:
+     https://github.com/Exzap/ZArchive/releases
+  2. Descarga el archivo ejecutable "zarchive.exe" de la version mas reciente.
+     (Nota: No requiere instalacion, es un ejecutable portatil).
+
+PASO 2: Extraer el archivo .wua
+  Metodo A - Arrastrar y soltar (El mas sencillo):
+    1. Coloca "zarchive.exe" en la misma carpeta donde tienes tu archivo .wua.
+    2. Haz clic sobre tu archivo .wua, arrastralo y SUELTALO encima de "zarchive.exe".
+    3. Se abrira una ventana de consola y comenzara la descompresion automatica.
+       Tardara entre 30 y 60 segundos dependiendo de la velocidad de tu disco.
+
+  Metodo B - Por linea de comandos (CMD / PowerShell):
+    Ejecuta el siguiente comando indicando la ruta:
+    zarchive.exe "Tu_Archivo_Juego.wua" "Carpeta_Destino"
+
+PASO 3: Verificar las carpetas generadas
+  Al terminar la extraccion, obtendras una carpeta con los datos del juego.
+  Asegurate de que contenga las dos carpetas correspondientes a la version USA:
+    - 0005000010118300 (o 0005000010118300_v0) -> Juego Base USA
+    - 0005000e10118300 (o 0005000e10118300_v32) -> Actualizacion v32 USA
+
+  Cada una de estas dos carpetas debe tener en su interior:
+    - code/
+    - content/
+    - meta/
+
+PASO 4: Cargar en el Launcher (MH3U.exe)
+  1. Ejecuta "MH3U.exe".
+  2. Ve a la pestaña "⚙️ Instalacion & Dump".
+  3. Haz clic en "Examinar carpeta..." y selecciona la carpeta contenedora donde
+     estan las dos carpetas del juego base y la actualizacion.
+  4. Los indicadores se iluminaran en VERDE 🟢:
+     - 🟢 Juego Base USA (0005000010118300): DETECTADO
+     - 🟢 Actualizacion v32 (0005000e10118300): DETECTADA
+  5. Haz clic en "Traducir y Compilar Port" y cuando termine ya podras jugar.
+
+
+================================================================================
+  [EN] STEP-BY-STEP GUIDE TO EXTRACT YOUR .WUA FILE
+================================================================================
+
+REQUIREMENTS:
+  - Your Monster Hunter 3 Ultimate .wua file (USA release with v32 update).
+  - The official ZArchive utility created by Exzap (author of Cemu).
+
+STEP 1: Download the official ZArchive utility
+  1. Open your web browser and navigate to the official GitHub releases page:
+     https://github.com/Exzap/ZArchive/releases
+  2. Download the latest "zarchive.exe" release binary.
+     (Note: No installation required, it is a standalone portable executable).
+
+STEP 2: Extract the .wua file
+  Method A - Drag & Drop (Easiest):
+    1. Place "zarchive.exe" in the same folder as your .wua file.
+    2. Click on your .wua file, drag it, and DROP it directly onto "zarchive.exe".
+    3. A console window will appear and extraction will proceed automatically.
+       This typically takes 30-60 seconds depending on storage speed.
+
+  Method B - Command Line (CMD / PowerShell):
+    Run the following command:
+    zarchive.exe "Your_Game_File.wua" "Destination_Folder"
+
+STEP 3: Verify the extracted folders
+  Once finished, you should have the uncompressed game folders.
+  Ensure both USA folders are present:
+    - 0005000010118300 (or 0005000010118300_v0) -> USA Base Game
+    - 0005000e10118300 (or 0005000e10118300_v32) -> USA v32 Update
+
+  Both folders must contain the standard Wii U subfolders:
+    - code/
+    - content/
+    - meta/
+
+STEP 4: Select in the Launcher (MH3U.exe)
+  1. Launch "MH3U.exe".
+  2. Go to the "⚙️ Instalacion & Dump" tab.
+  3. Click "Examinar carpeta..." and select the parent folder containing both dumps.
+  4. The status badges will turn GREEN 🟢:
+     - 🟢 Juego Base USA (0005000010118300): DETECTADO
+     - 🟢 Actualizacion v32 (0005000e10118300): DETECTADA
+  5. Click "Traducir y Compilar Port", and once done, click PLAY!
+
+
+================================================================================
+  SOLUCION DE PROBLEMAS / TROUBLESHOOTING
+================================================================================
+[ES]
+- ¿Por que dice que falta el juego base o la actualizacion?
+  El port SOLO es compatible con la edicion de Estados Unidos (USA) con la
+  actualizacion v32. Las versiones EUR (0005000010117200) y JPN (MH3G HD) NO son
+  compatibles debido a que tienen binarios y direcciones de memoria diferentes.
+
+- ¿Que hago si no tengo el compilador Clang?
+  Dentro del launcher, en la pestaña "⚙️ Instalacion & Dump", haz clic en el boton
+  "⬇️ Descargar Clang Portatil". El launcher lo descargara y configurara de forma
+  100% automatica sin necesidad de instalar nada en Windows.
+
+[EN]
+- Why does it say base game or update is missing?
+  The port ONLY supports the USA release with the latest v32 update. EUR
+  (0005000010117200) and JPN (MH3G HD) releases are NOT supported because they
+  feature different binary code layouts and memory addresses.
+
+- What if Clang compiler is not detected?
+  Inside the launcher under "⚙️ Instalacion & Dump", click the button
+  "⬇️ Descargar Clang Portatil". The launcher will download and set up a portable
+  Clang toolchain automatically without installing anything on Windows.
+================================================================================

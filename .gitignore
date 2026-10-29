@@ -1,0 +1,28 @@
+# Binaries and large artifacts: published as GitHub Release assets, never committed
+*.exe
+*.dll
+*.zip
+*.7z
+dist/
+dist-release/
+build/
+__pycache__/
+*.pyc
+
+# Per-user / per-machine data
+launcher_config.json
+game.dll.rev
+*.log
+_update/
+_update_backup/
+apply_update.bat
+toolchain/
+
+# Game content: never commit (copyrighted)
+MH3U_Dump/
+*.wua
+*.wud
+*.wux
+*.rpx
+*.rpl
+*.jpg

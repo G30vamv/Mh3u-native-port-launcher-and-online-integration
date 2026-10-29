@@ -1,0 +1,16 @@
+name: CI
+on:
+  push:
+  pull_request:
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Syntax check
+        run: python -m py_compile launcher/mh3u_launcher.py launcher/updater.py tools/make_release.py
+      - name: Updater tests
+        run: python -m unittest discover -s tests -v
