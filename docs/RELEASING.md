@@ -10,7 +10,7 @@
 ## 2. Publicar (un solo zip)
 
 ```powershell
-python tools/publish_release.py --version v0.8.3 --dir "<carpeta distribuible>" --title "v0.8.3 - Título corto" --notes-file notas.md
+python tools/publish_release.py --version v0.8.3 --dir "<carpeta distribuible>" --title "v0.8.3 - Título corto" --notes-file notas.md --summary "Frase corta para el diálogo de actualización"
 ```
 
 Requiere `gh` autenticado. `--dry-run` solo construye el zip; `--replace` reemplaza los archivos de un release ya existente.

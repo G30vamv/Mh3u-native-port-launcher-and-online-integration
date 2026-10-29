@@ -78,6 +78,7 @@ def main():
     ap.add_argument("--title", required=True)
     ap.add_argument("--notes-file", required=True)
     ap.add_argument("--no-server", action="store_true")
+    ap.add_argument("--summary", default="", help="one line shown in the launcher's update dialog")
     ap.add_argument("--dry-run", action="store_true", help="build assets only; no push, no release")
     ap.add_argument("--replace", action="store_true", help="release already exists: replace its assets")
     args = ap.parse_args()
@@ -107,7 +108,7 @@ def main():
     run(["git", "push", "-q", "-f", "origin", tag], UPDATES_DIR)
     for e in entries:
         e["url"] = f"{RAW}{sha}/{e['path']}"
-    manifest = {"version": args.version, "notes": notes.strip().splitlines()[0] if notes.strip() else "", "files": entries}
+    manifest = {"version": args.version, "notes": args.summary, "files": entries}
     mpath = os.path.join(out, "manifest.json")
     with open(mpath, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, ensure_ascii=False)
