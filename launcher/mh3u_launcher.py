@@ -51,7 +51,7 @@ _TH["CTkComboBox"].update({"button_color": ["#3b6073", "#3b6073"], "button_hover
 _TH["CTkEntry"].update({"fg_color": ["#fff6e0", "#0d1820"], "border_color": ["#b9a97f", "#2b4a58"]})
 _TH["CTkScrollbar"].update({"button_color": ["#3b6073", "#3b6073"], "button_hover_color": ["#c98f2b", "#c98f2b"]})
 
-APP_VERSION = "v0.7.7"
+APP_VERSION = "v0.8.0"
 
 # Bump when the translator output changes (e.g. more functions discovered). A game.dll built
 # by an older translator lacks functions the online code needs ("not a translated function").
