@@ -27,6 +27,11 @@ import socket
 import webbrowser
 
 try:
+    import toolchain_installer
+except Exception:  # optional: falls back to the full-zip download
+    toolchain_installer = None
+
+try:
     import updater
 except Exception:  # update support is optional; the launcher must work without it
     updater = None
@@ -51,7 +56,7 @@ _TH["CTkComboBox"].update({"button_color": ["#3b6073", "#3b6073"], "button_hover
 _TH["CTkEntry"].update({"fg_color": ["#fff6e0", "#0d1820"], "border_color": ["#b9a97f", "#2b4a58"]})
 _TH["CTkScrollbar"].update({"button_color": ["#3b6073", "#3b6073"], "button_hover_color": ["#c98f2b", "#c98f2b"]})
 
-APP_VERSION = "v0.8.3"
+APP_VERSION = "v0.8.4"
 
 # Header update widget colors (state -> label color) and button looks: (fg, hover)
 UPDATE_COLORS = {"info": "#9db3ba", "ok": "#7fcfa6", "warn": "#eab84c", "error": "#e07a6f"}
@@ -112,7 +117,9 @@ def get_local_ip_addresses():
             "-Command",
             "Get-NetIPAddress -AddressFamily IPv4 | Select-Object IPAddress, InterfaceAlias | ConvertTo-Json",
         ]
-        out = subprocess.check_output(cmd, text=True, timeout=1.5)
+        out = subprocess.check_output(
+            cmd, text=True, timeout=1.5, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
+        )
         items = json.loads(out)
         if isinstance(items, dict):
             items = [items]
@@ -2348,7 +2355,7 @@ class MH3ULauncherApp(ctk.CTk):
             messagebox.showwarning("En progreso", "Ya hay una descarga o compilación activa.")
             return
 
-        msg = "Se descargará un paquete portátil de LLVM-MinGW Clang (~140MB comprimido) directamente en la carpeta del launcher.\n\nEsto permitirá compilar el port de forma 100% autónoma sin instalar nada en tu sistema.\n\n¿Deseas continuar?"
+        msg = "Se descargará un paquete portátil de LLVM-MinGW Clang (solo lo necesario para compilar, ~90 MB) directamente en la carpeta del launcher.\n\nEsto permitirá compilar el port de forma 100% autónoma sin instalar nada en tu sistema.\n\n¿Deseas continuar?"
         if not messagebox.askyesno("Descarga de Compilador Portátil", msg):
             return
 
@@ -2364,62 +2371,18 @@ class MH3ULauncherApp(ctk.CTk):
         base_dir = get_base_dir()
         toolchain_dir = os.path.join(base_dir, "toolchain")
 
-        # Try saving temp zip locally, or fallback to %TEMP% if local directory is write-protected (e.g. MINEDUCYT / Documents)
-        temp_candidates = [
-            os.path.join(base_dir, "llvm_mingw_temp.zip"),
-            os.path.join(tempfile.gettempdir(), "llvm_mingw_temp.zip"),
-        ]
-
-        temp_zip = None
-        for candidate in temp_candidates:
-            try:
-                with open(candidate, "wb") as f:
-                    pass
-                os.remove(candidate)
-                temp_zip = candidate
-                break
-            except Exception:
-                continue
-
-        if not temp_zip:
-            temp_zip = os.path.join(tempfile.gettempdir(), "llvm_mingw_temp.zip")
-
         try:
-            self._log(f"Descargando desde: {LLVM_MINGW_URL}")
-            req = urllib.request.Request(LLVM_MINGW_URL, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req) as response, open(temp_zip, "wb") as out_file:
-                total_size = int(response.headers.get("Content-Length", 0))
-                downloaded = 0
-                block_size = 1024 * 64
-                while True:
-                    chunk = response.read(block_size)
-                    if not chunk:
-                        break
-                    out_file.write(chunk)
-                    downloaded += len(chunk)
-                    if total_size > 0:
-                        self.ui_queue.put(("progress", (downloaded / total_size) * 0.7))
-
-            self._log("Descarga completa. Descomprimiendo archivos en toolchain/...")
-            self.ui_queue.put(("progress", 0.75))
-
-            # Unpack
-            os.makedirs(toolchain_dir, exist_ok=True)
-            with zipfile.ZipFile(temp_zip, "r") as zip_ref:
-                first_dir = zip_ref.namelist()[0].split("/")[0]
-                zip_ref.extractall(base_dir)
-
-            extracted_folder = os.path.join(base_dir, first_dir)
-            if os.path.exists(extracted_folder) and extracted_folder != toolchain_dir:
-                if os.path.exists(toolchain_dir):
-                    shutil.rmtree(toolchain_dir, ignore_errors=True)
-                os.rename(extracted_folder, toolchain_dir)
-
-            if os.path.exists(temp_zip):
-                try:
-                    os.remove(temp_zip)
-                except Exception:
-                    pass
+            if toolchain_installer:
+                allow = toolchain_installer.load_allowlist(os.path.join(self.assets_dir, "toolchain_files.txt"))
+                toolchain_installer.install(
+                    LLVM_MINGW_URL,
+                    base_dir,
+                    allow,
+                    progress=lambda f: self.ui_queue.put(("progress", max(0.05, f))),
+                    log=self._log,
+                )
+            else:
+                self._download_full_toolchain(base_dir, toolchain_dir)
 
             self.ui_queue.put(("progress", 1.0))
             self._log("¡Compilador portátil instalado correctamente en la carpeta toolchain/!")
@@ -2432,6 +2395,36 @@ class MH3ULauncherApp(ctk.CTk):
             self.is_downloading_toolchain = False
             self.ui_queue.put(("btn_download", {"state": "normal"}))
             self.ui_queue.put(("refresh", None))
+
+    def _download_full_toolchain(self, base_dir, toolchain_dir):
+        """Legacy path: download the whole LLVM-MinGW zip and extract everything."""
+        temp_zip = os.path.join(tempfile.gettempdir(), "llvm_mingw_temp.zip")
+        self._log(f"Descargando desde: {LLVM_MINGW_URL}")
+        req = urllib.request.Request(LLVM_MINGW_URL, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req) as response, open(temp_zip, "wb") as out_file:
+            total_size = int(response.headers.get("Content-Length", 0))
+            downloaded = 0
+            while True:
+                chunk = response.read(1024 * 64)
+                if not chunk:
+                    break
+                out_file.write(chunk)
+                downloaded += len(chunk)
+                if total_size > 0:
+                    self.ui_queue.put(("progress", (downloaded / total_size) * 0.7))
+        self._log("Descarga completa. Descomprimiendo archivos en toolchain/...")
+        with zipfile.ZipFile(temp_zip, "r") as zip_ref:
+            first_dir = zip_ref.namelist()[0].split("/")[0]
+            zip_ref.extractall(base_dir)
+        extracted_folder = os.path.join(base_dir, first_dir)
+        if os.path.exists(extracted_folder) and extracted_folder != toolchain_dir:
+            if os.path.exists(toolchain_dir):
+                shutil.rmtree(toolchain_dir, ignore_errors=True)
+            os.rename(extracted_folder, toolchain_dir)
+        try:
+            os.remove(temp_zip)
+        except Exception:
+            pass
 
     # =========================================================================
     # COMPILATION WORKER
@@ -2589,6 +2582,7 @@ class MH3ULauncherApp(ctk.CTk):
                 encoding="utf-8",
                 errors="replace",
                 env=env,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0,
             )
 
             # Background thread to monitor progress of .o file generation
