@@ -146,8 +146,10 @@ def write_apply_script(todo, base_dir, version):
     backup = os.path.join(base_dir, BACKUP_DIR, str(version))
     lines = [
         "@echo off",
+        "chcp 65001 >nul",
         "setlocal",
         f'cd /d "{base_dir}"',
+        "echo [%date% %time%] apply_update: esperando a que cierre el launcher",
         f"set PID={os.getpid()}",
         ":wait",
         '"{S32}tasklist.exe" /FI "PID eq %PID%" 2>nul | "{S32}find.exe" "%PID%" >nul'.replace('{S32}', S32),
@@ -155,6 +157,7 @@ def write_apply_script(todo, base_dir, version):
         '"{S32}taskkill.exe" /F /IM mh3u-tools.exe >nul 2>&1'.replace('{S32}', S32),
         '"{S32}taskkill.exe" /F /IM server.exe >nul 2>&1'.replace('{S32}', S32),
         '"{S32}ping.exe" -n 2 127.0.0.1 >nul'.replace('{S32}', S32),
+        "echo [%date% %time%] apply_update: aplicando archivos",
         f'if exist "{backup}" rmdir /S /Q "{backup}"',
         f'mkdir "{backup}"',
         "set FAIL=0",
@@ -172,22 +175,38 @@ def write_apply_script(todo, base_dir, version):
             f'if not exist "{os.path.dirname(dst)}" mkdir "{os.path.dirname(dst)}"',
             f'move /Y "{src}" "{dst}" >nul || set FAIL=1',
         ]
-    lines += ["if %FAIL%==1 goto rollback", "goto done", ":rollback"]
+    lines += ["if %FAIL%==1 goto rollback", "goto done", ":rollback", "echo [%date% %time%] apply_update: ERROR, revirtiendo"]
     for e in todo:
         rel = e["rel"]
         lines.append(f'if exist "{os.path.join(backup, rel)}" copy /Y "{os.path.join(backup, rel)}" "{os.path.join(base_dir, rel)}" >nul')
     lines += [
         ":done",
+        "echo [%date% %time%] apply_update: listo, reabriendo el launcher",
         f'rmdir /S /Q "{stage}" >nul 2>&1',
         f"start \"\" {_relaunch_command()}",
         '(goto) 2>nul & del "%~f0"',
     ]
     script = os.path.join(base_dir, "apply_update.bat")
-    with open(script, "w", encoding="ascii", errors="replace", newline="") as f:
+    with open(script, "w", encoding="utf-8", newline="") as f:
         f.write("\r\n".join(lines) + "\r\n")
     return script
 
 
 def launch_apply_script(script):
-    flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
-    subprocess.Popen(["cmd.exe", "/c", script], creationflags=flags, close_fds=True)
+    """Run the script hidden and independent of this process.
+
+    CREATE_NO_WINDOW (not DETACHED_PROCESS): a console-less cmd.exe dies silently on the
+    `tasklist | find` pipe, so the update was never applied (v0.8.0-v0.8.2). Output goes to
+    apply_update.log next to the script for diagnosis.
+    """
+    flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    log = os.path.join(os.path.dirname(script), "apply_update.log")
+    with open(log, "w", encoding="utf-8", errors="replace") as lf:
+        subprocess.Popen(
+            ["cmd.exe", "/c", script],
+            creationflags=flags,
+            close_fds=True,
+            stdin=subprocess.DEVNULL,
+            stdout=lf,
+            stderr=subprocess.STDOUT,
+        )

@@ -4,7 +4,10 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
+
+CRLF = chr(13) + chr(10)
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "launcher"))
 import updater  # noqa: E402
@@ -78,6 +81,48 @@ class UpdaterTests(unittest.TestCase):
             self.assertEqual(updater.fetch_manifest()["version"], "v1.0.0")
         finally:
             del os.environ[updater.MANIFEST_ENV]
+
+    @unittest.skipUnless(os.name == "nt", "apply_update.bat is Windows-only")
+    def test_apply_script_runs_when_launched_hidden(self):
+        """Regression: a DETACHED_PROCESS cmd.exe died on the `tasklist | find` pipe and never applied the update."""
+        stage = os.path.join(self.base, updater.UPDATE_DIR)
+        os.makedirs(stage)
+        self._write(stage, "file.txt", b"NEW")
+        self._write(self.base, "file.txt", b"OLD")
+        script = updater.write_apply_script([{"rel": "file.txt"}], self.base, "vTEST")
+        lines = [l for l in open(script, encoding="utf-8").read().splitlines() if "taskkill" not in l and not l.startswith('start ""')]
+        lines = [l.replace("set PID=%d" % os.getpid(), "set PID=99999999") for l in lines]
+        with open(script, "w", encoding="utf-8", newline="") as f:
+            f.write(CRLF.join(lines) + CRLF)
+        updater.launch_apply_script(script)
+        for _ in range(40):
+            with open(os.path.join(self.base, "file.txt"), "rb") as f:
+                if f.read() == b"NEW":
+                    break
+            time.sleep(0.5)
+        with open(os.path.join(self.base, "file.txt"), "rb") as f:
+            self.assertEqual(f.read(), b"NEW")
+        self.assertTrue(os.path.isfile(os.path.join(self.base, updater.BACKUP_DIR, "vTEST", "file.txt")))
+
+    @unittest.skipUnless(os.name == "nt", "apply_update.bat is Windows-only")
+    def test_apply_script_handles_non_ascii_paths(self):
+        base = os.path.join(self.tmp.name, "Peña ñandú")
+        os.makedirs(os.path.join(base, updater.UPDATE_DIR))
+        self._write(os.path.join(base, updater.UPDATE_DIR), "file.txt", b"NEW")
+        self._write(base, "file.txt", b"OLD")
+        script = updater.write_apply_script([{"rel": "file.txt"}], base, "vTEST")
+        lines = [l for l in open(script, encoding="utf-8").read().splitlines() if "taskkill" not in l and not l.startswith('start ""')]
+        lines = [l.replace("set PID=%d" % os.getpid(), "set PID=99999999") for l in lines]
+        with open(script, "w", encoding="utf-8", newline="") as f:
+            f.write(CRLF.join(lines) + CRLF)
+        updater.launch_apply_script(script)
+        for _ in range(40):
+            with open(os.path.join(base, "file.txt"), "rb") as f:
+                if f.read() == b"NEW":
+                    break
+            time.sleep(0.5)
+        with open(os.path.join(base, "file.txt"), "rb") as f:
+            self.assertEqual(f.read(), b"NEW")
 
 
 if __name__ == "__main__":
