@@ -1,0 +1,756 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 4a4e526..f98f43a 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -26,3 +26,7 @@ mh3u-testkit = { path = "crates/mh3u-testkit" }
+ mh3u-latte = { path = "crates/mh3u-latte" }
+ mh3u-audio = { path = "crates/mh3u-audio" }
+ mh3u-mods = { path = "crates/mh3u-mods" }
++
++[profile.release]
++lto = "fat"
++codegen-units = 1
+diff --git a/crates/mh3u-gfx/src/draw.rs b/crates/mh3u-gfx/src/draw.rs
+index d51f209..b6a34d8 100644
+--- a/crates/mh3u-gfx/src/draw.rs
++++ b/crates/mh3u-gfx/src/draw.rs
+@@ -1,6 +1,7 @@
+ //! What a draw call becomes: the game's shaders translated to WGSL, its vertex data decoded on the CPU, and a render pipeline made from
+ //! the recorded state, cached by what makes it different.
+ 
++use crate::fxmap::{HashMap, HashSet};
+ use crate::gx2::Gx2;
+ use crate::shader_cache::{FrontCache, Lookup, Ranges};
+ use crate::state::State;
+@@ -9,7 +10,6 @@ use mh3u_latte::translate::{
+     Context, IDENTITY_SELECT, Interface, PixelInputs, TexKind, VertexAttribute, VertexInputs, translate_pixel, translate_vertex,
+ };
+ use mh3u_rt::Guest;
+-use std::collections::{HashMap, HashSet};
+ use std::hash::{Hash, Hasher};
+ use std::sync::Arc;
+ use std::time::Instant;
+@@ -2987,18 +2987,18 @@ impl Gx2 {
+         self.batch.slots_used = 0;
+         lap.mark("arena uploads");
+         // wgpu 30 records a pass's commands when the pass ends but checks them, tracks the resources and makes the backend's (Vulkan's
+-        // or D3D12's) commands only here, in `finish`: the batch's draws cost most of their GPU-side CPU time at this point
++        // or D3D12's) commands only in `finish`: the batch's draws cost most of their GPU-side CPU time there, so the queue's thread does
++        // the finishing and the submit, after the writes above
+         let mut work = Vec::new();
+         if let Some(pre) = self.batch.pre.take() {
+-            work.push(pre.finish());
++            work.push(pre);
+         }
+         if let Some(enc) = self.batch.enc.take() {
+-            work.push(enc.finish());
++            work.push(enc);
+         }
+-        lap.mark("command encoding (finish)");
+         if !work.is_empty() {
+-            self.d.queue.submit(work);
+-            lap.mark("submit");
++            self.d.queue.encode_and_submit(work);
++            lap.mark("command encoding and submit (handed over)");
+         }
+         for a in self.batch.arenas.iter_mut().flatten() {
+             a.used = 0;
+diff --git a/crates/mh3u-gfx/src/fxmap.rs b/crates/mh3u-gfx/src/fxmap.rs
+new file mode 100644
+index 0000000..2d837ef
+--- /dev/null
++++ b/crates/mh3u-gfx/src/fxmap.rs
+@@ -0,0 +1,51 @@
++//! A fast hasher for the renderer's per-draw lookups: the keys are small integers and tuples of them, so SipHash's DoS resistance only costs time.
++
++use std::hash::{BuildHasherDefault, Hasher};
++
++#[derive(Default, Clone, Copy)]
++pub struct FxHasher(u64);
++
++const SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
++
++impl FxHasher {
++    #[inline]
++    fn add(&mut self, w: u64) {
++        self.0 = (self.0.rotate_left(5) ^ w).wrapping_mul(SEED);
++    }
++}
++
++impl Hasher for FxHasher {
++    #[inline]
++    fn write(&mut self, bytes: &[u8]) {
++        let mut chunks = bytes.chunks_exact(8);
++        for c in &mut chunks {
++            self.add(u64::from_le_bytes(c.try_into().unwrap()));
++        }
++        for &b in chunks.remainder() {
++            self.add(b as u64);
++        }
++    }
++    #[inline]
++    fn write_u8(&mut self, i: u8) {
++        self.add(i as u64);
++    }
++    #[inline]
++    fn write_u32(&mut self, i: u32) {
++        self.add(i as u64);
++    }
++    #[inline]
++    fn write_u64(&mut self, i: u64) {
++        self.add(i);
++    }
++    #[inline]
++    fn write_usize(&mut self, i: usize) {
++        self.add(i as u64);
++    }
++    #[inline]
++    fn finish(&self) -> u64 {
++        self.0
++    }
++}
++
++pub type HashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
++pub type HashSet<K> = std::collections::HashSet<K, BuildHasherDefault<FxHasher>>;
+diff --git a/crates/mh3u-gfx/src/gx2.rs b/crates/mh3u-gfx/src/gx2.rs
+index 1ce1560..0a44513 100644
+--- a/crates/mh3u-gfx/src/gx2.rs
++++ b/crates/mh3u-gfx/src/gx2.rs
+@@ -2,9 +2,9 @@
+ //! console's frame pacing. Draws, shaders and textures are the next part.
+ 
+ use crate::Display;
++use crate::fxmap::HashMap;
+ use crate::state::{State, arg, farg};
+ use mh3u_rt::{Ctx, Guest, Gx2Backend};
+-use std::collections::HashMap;
+ use std::time::{Duration, Instant};
+ 
+ /// The calls this backend handles, as a compact number: recorded display lists keep this, and calls are dispatched by it, not by name.
+@@ -189,10 +189,14 @@ pub(crate) fn texture_format(gx2: u32) -> wgpu::TextureFormat {
+     }
+ }
+ 
+-const BLIT: &str = "
++fn make_blit_shader(upscaler: &str, sharpness: f32) -> String {
++    let mut s = String::new();
++    s.push_str(
++        r#"
+ @group(0) @binding(0) var picture: texture_2d<f32>;
+ @group(0) @binding(1) var picture_sampler: sampler;
+ struct Out { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32> };
++
+ @vertex fn vs(@builtin(vertex_index) i: u32) -> Out {
+     let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+     var o: Out;
+@@ -200,14 +204,124 @@ struct Out { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>
+     o.uv = vec2<f32>(p.x, 1.0 - p.y);
+     return o;
+ }
+-@fragment fn fs(in: Out) -> @location(0) vec4<f32> { return textureSample(picture, picture_sampler, in.uv); }
+-";
++"#,
++    );
++
++    if upscaler == "cas" {
++        s.push_str(&format!(
++            r#"
++fn sample_upscaler(uv: vec2<f32>) -> vec3<f32> {{
++    let dims = vec2<f32>(textureDimensions(picture));
++    let texel = 1.0 / dims;
++
++    let m = textureSample(picture, picture_sampler, uv).rgb;
++    let a = textureSample(picture, picture_sampler, uv + vec2<f32>(0.0, -texel.y)).rgb;
++    let b = textureSample(picture, picture_sampler, uv + vec2<f32>(0.0, texel.y)).rgb;
++    let c = textureSample(picture, picture_sampler, uv + vec2<f32>(-texel.x, 0.0)).rgb;
++    let d = textureSample(picture, picture_sampler, uv + vec2<f32>(texel.x, 0.0)).rgb;
++
++    let tl = textureSample(picture, picture_sampler, uv + vec2<f32>(-texel.x, -texel.y)).rgb;
++    let tr = textureSample(picture, picture_sampler, uv + vec2<f32>(texel.x, -texel.y)).rgb;
++    let bl = textureSample(picture, picture_sampler, uv + vec2<f32>(-texel.x, texel.y)).rgb;
++    let br = textureSample(picture, picture_sampler, uv + vec2<f32>(texel.x, texel.y)).rgb;
++
++    let min_rgb = min(m, min(min(a, b), min(c, d)));
++    let min_all = min(min_rgb, min(min(tl, tr), min(bl, br)));
++    let max_rgb = max(m, max(max(a, b), max(c, d)));
++    let max_all = max(max_rgb, max(max(tl, tr), max(bl, br)));
++
++    let amp_r = clamp(min(min_all.r, 1.0 - max_all.r) / max(max_all.r - min_all.r, 0.0001), 0.0, 1.0);
++    let amp_g = clamp(min(min_all.g, 1.0 - max_all.g) / max(max_all.g - min_all.g, 0.0001), 0.0, 1.0);
++    let amp_b = clamp(min(min_all.b, 1.0 - max_all.b) / max(max_all.b - min_all.b, 0.0001), 0.0, 1.0);
++
++    let sharpness = {sharpness:.3};
++    let w_r = -sqrt(amp_r) * (sharpness * 0.20);
++    let w_g = -sqrt(amp_g) * (sharpness * 0.20);
++    let w_b = -sqrt(amp_b) * (sharpness * 0.20);
++    let w = vec3<f32>(w_r, w_g, w_b);
++
++    let cross_sum = a + b + c + d;
++    let filtered = (cross_sum * w + m) / (vec3<f32>(1.0) + 4.0 * w);
++    return clamp(filtered, min_rgb, max_rgb);
++}}
++"#
++        ));
++    } else if upscaler == "fsr" {
++        s.push_str(&format!(
++            r#"
++fn sample_upscaler(uv: vec2<f32>) -> vec3<f32> {{
++    let dims = vec2<f32>(textureDimensions(picture));
++    let texel = 1.0 / dims;
++
++    let pp = uv * dims - 0.5;
++    let fp = fract(pp);
++
++    let c0 = textureSample(picture, picture_sampler, uv + vec2<f32>(-0.5, -0.5) * texel).rgb;
++    let c1 = textureSample(picture, picture_sampler, uv + vec2<f32>( 0.5, -0.5) * texel).rgb;
++    let c2 = textureSample(picture, picture_sampler, uv + vec2<f32>(-0.5,  0.5) * texel).rgb;
++    let c3 = textureSample(picture, picture_sampler, uv + vec2<f32>( 0.5,  0.5) * texel).rgb;
++
++    let c_top = textureSample(picture, picture_sampler, uv + vec2<f32>(0.0, -1.0) * texel).rgb;
++    let c_bot = textureSample(picture, picture_sampler, uv + vec2<f32>(0.0,  1.0) * texel).rgb;
++    let c_lef = textureSample(picture, picture_sampler, uv + vec2<f32>(-1.0, 0.0) * texel).rgb;
++    let c_rig = textureSample(picture, picture_sampler, uv + vec2<f32>( 1.0, 0.0) * texel).rgb;
++
++    let l_weights = vec3<f32>(0.2126, 0.7152, 0.0722);
++    let l0 = dot(c0, l_weights);
++    let l1 = dot(c1, l_weights);
++    let l2 = dot(c2, l_weights);
++    let l3 = dot(c3, l_weights);
++
++    let dir_h = (l1 - l0) + (l3 - l2);
++    let dir_v = (l2 - l0) + (l3 - l1);
++    let dir_d1 = (l3 - l0);
++    let dir_d2 = (l2 - l1);
++
++    let edge_strength = clamp(abs(dir_h) + abs(dir_v) + abs(dir_d1) + abs(dir_d2), 0.0, 1.0);
++
++    let b_top = mix(c0, c1, fp.x);
++    let b_bot = mix(c2, c3, fp.x);
++    let base = mix(b_top, b_bot, fp.y);
++
++    let min_c = min(min(c0, c1), min(c2, c3));
++    let max_c = max(max(c0, c1), max(c2, c3));
++    let cross_c = (c_top + c_bot + c_lef + c_rig) * 0.25;
++
++    let sharpness = {sharpness:.3};
++    let sharp_amt = mix(0.12, 0.38, edge_strength) * sharpness;
++    let enhanced = base + (base - cross_c) * sharp_amt;
++
++    return clamp(enhanced, min_c, max_c);
++}}
++"#
++        ));
++    } else {
++        s.push_str(
++            r#"
++fn sample_upscaler(uv: vec2<f32>) -> vec3<f32> {
++    return textureSample(picture, picture_sampler, uv).rgb;
++}
++"#,
++        );
++    }
++
++    s.push_str(
++        r#"
++@fragment fn fs(in: Out) -> @location(0) vec4<f32> {
++    let c = sample_upscaler(in.uv);
++    return vec4<f32>(c, 1.0);
++}
++"#,
++    );
++
++    s
++}
+ 
+ impl Gx2 {
+     /// Draws the mod overlay (unless `MH3U_OVERLAY=off`), with the game's data from the dump's base folder, the wishlist in `dir`, and
+     /// the hunters' names from the game's save folder (to find the live save by).
+     pub fn use_overlay(&mut self, dump_base: std::path::PathBuf, dir: std::path::PathBuf, save_dir: std::path::PathBuf) {
+-        if crate::overlay::enabled() && self.d.window.is_some() {
++        if (crate::overlay::enabled() || std::env::var_os("MH3U_FPS").is_some()) && self.d.window.is_some() {
+             self.overlay = Some(crate::overlay::Overlay::new(dump_base, dir, save_dir));
+         }
+     }
+@@ -229,12 +343,32 @@ impl Gx2 {
+         let format = caps.as_ref().map_or(wgpu::TextureFormat::Bgra8Unorm, |caps| {
+             caps.formats.iter().copied().find(|f| !f.is_srgb()).unwrap_or(caps.formats[0])
+         });
++        let requested_mode = match std::env::var("MH3U_PRESENT_MODE").ok().as_deref() {
++            Some("mailbox") => wgpu::PresentMode::Mailbox,
++            Some("immediate") | Some("off") => wgpu::PresentMode::Immediate,
++            Some("fifo_relaxed") => wgpu::PresentMode::FifoRelaxed,
++            _ => wgpu::PresentMode::Fifo,
++        };
++        let present_mode = if let Some(ref c) = caps {
++            if c.present_modes.contains(&requested_mode) {
++                requested_mode
++            } else if requested_mode == wgpu::PresentMode::Mailbox && c.present_modes.contains(&wgpu::PresentMode::Immediate) {
++                wgpu::PresentMode::Immediate
++            } else {
++                wgpu::PresentMode::Fifo
++            }
++        } else {
++            requested_mode
++        };
++        if present_mode != wgpu::PresentMode::Fifo {
++            eprintln!("[gfx] present mode: {present_mode:?}");
++        }
+         let config = wgpu::SurfaceConfiguration {
+             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+             format,
+             width: size.width.max(1),
+             height: size.height.max(1),
+-            present_mode: wgpu::PresentMode::Fifo,
++            present_mode,
+             desired_maximum_frame_latency: 2,
+             alpha_mode: caps.as_ref().map_or(wgpu::CompositeAlphaMode::Auto, |caps| caps.alpha_modes[0]),
+             view_formats: vec![],
+@@ -243,9 +377,20 @@ impl Gx2 {
+         if let Some(surface) = &d.surface {
+             surface.configure(&d.device, &config);
+         }
++        let upscaler = std::env::var("MH3U_UPSCALER").unwrap_or_else(|_| "fsr".to_string()).to_lowercase();
++        let sharpness: f32 = std::env::var("MH3U_FSR_SHARPNESS")
++            .ok()
++            .and_then(|v| v.parse().ok())
++            .unwrap_or(0.75);
++        match upscaler.as_str() {
++            "fsr" => eprintln!("[gfx] upscaler: AMD FidelityFX FSR 1.0 (sharpness: {sharpness:.2})"),
++            "cas" => eprintln!("[gfx] upscaler: AMD FidelityFX CAS (sharpness: {sharpness:.2})"),
++            _ => eprintln!("[gfx] upscaler: Bilinear (Off)"),
++        }
++        let blit_src = make_blit_shader(&upscaler, sharpness);
+         let module = d.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+             label: Some("blit"),
+-            source: wgpu::ShaderSource::Wgsl(BLIT.into()),
++            source: wgpu::ShaderSource::Wgsl(blit_src.into()),
+         });
+         let layout = d.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+             label: None,
+@@ -307,13 +452,13 @@ impl Gx2 {
+             blit,
+             layout,
+             sampler,
+-            targets: HashMap::new(),
++            targets: HashMap::default(),
+             tv: None,
+             swaps: 0,
+             interval: 1,
+-            contexts: HashMap::new(),
++            contexts: HashMap::default(),
+             current: 0,
+-            lists: HashMap::new(),
++            lists: HashMap::default(),
+             recording: None,
+             draws: 0,
+             dumped: Default::default(),
+@@ -340,8 +485,8 @@ impl Gx2 {
+                 .ok()
+                 .and_then(|v| v.parse().ok())
+                 .unwrap_or(120),
+-            fetch_shaders: HashMap::new(),
+-            fetch_interned: HashMap::new(),
++            fetch_shaders: HashMap::default(),
++            fetch_interned: HashMap::default(),
+             fps: std::env::var_os("MH3U_FPS").map(|_| (Instant::now(), 0)),
+             diag: crate::report::Diagnostics::from_env(),
+             pipes,
+@@ -573,6 +718,7 @@ impl Gx2 {
+         self.d.queue.submit([enc.finish()]);
+         let slice = buffer.slice(..);
+         slice.map_async(wgpu::MapMode::Read, |_| {});
++        self.d.queue.flush();
+         let _ = self.d.device.poll(wgpu::PollType::wait_indefinitely());
+         let data = slice.get_mapped_range().ok()?;
+         let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+@@ -596,8 +742,11 @@ impl Gx2 {
+         if size.width != self.config.width || size.height != self.config.height {
+             self.config.width = size.width;
+             self.config.height = size.height;
++            self.d.queue.flush();
+             surface.configure(&self.d.device, &self.config);
+         }
++        // the surface gives out its next texture only after the last one was presented
++        self.d.queue.wait_presented();
+         let frame = match surface.get_current_texture() {
+             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+@@ -1110,10 +1259,15 @@ impl Gx2 {
+                     }
+                 }
+                 if let Some((since, at)) = self.fps {
+-                    // the frame rate, swaps per second, every five seconds (for comparing builds)
+                     let secs = since.elapsed().as_secs_f64();
+-                    if secs >= 5.0 {
+-                        eprintln!("[fps] {:.1}", f64::from(self.swaps - at) / secs);
++                    if secs >= 0.5 {
++                        let current_fps = f64::from(self.swaps - at) / secs;
++                        if let Some(w) = &self.d.window {
++                            w.set_title(&format!("Monster Hunter 3 Ultimate - {:.0} FPS", current_fps));
++                        }
++                        if secs >= 5.0 {
++                            eprintln!("[fps] {:.1}", current_fps);
++                        }
+                         self.fps = Some((Instant::now(), self.swaps));
+                     }
+                 }
+diff --git a/crates/mh3u-gfx/src/lib.rs b/crates/mh3u-gfx/src/lib.rs
+index ddf9ffa..d767576 100644
+--- a/crates/mh3u-gfx/src/lib.rs
++++ b/crates/mh3u-gfx/src/lib.rs
+@@ -5,6 +5,7 @@ mod draw;
+ #[cfg(test)]
+ mod draw_bench;
+ pub mod events;
++mod fxmap;
+ mod geometry;
+ mod gx2;
+ pub mod icon;
+@@ -12,6 +13,7 @@ pub mod kbm;
+ pub mod overlay;
+ mod perf;
+ mod pipelines;
++mod queue;
+ mod report;
+ mod shader_cache;
+ mod state;
+@@ -40,7 +42,7 @@ pub struct Display {
+     pub instance: wgpu::Instance,
+     pub adapter: wgpu::Adapter,
+     pub device: wgpu::Device,
+-    pub queue: wgpu::Queue,
++    pub queue: queue::OrderedQueue,
+     pub surface: Option<wgpu::Surface<'static>>,
+ }
+ 
+@@ -72,7 +74,7 @@ impl Display {
+             instance,
+             adapter,
+             device,
+-            queue,
++            queue: queue::OrderedQueue::new(queue, true),
+             surface: Some(surface),
+         })
+     }
+@@ -104,7 +106,7 @@ impl Display {
+             instance,
+             adapter,
+             device,
+-            queue,
++            queue: queue::OrderedQueue::new(queue, false),
+             surface: None,
+         }
+     }
+diff --git a/crates/mh3u-gfx/src/overlay.rs b/crates/mh3u-gfx/src/overlay.rs
+index 722f6ec..6f0ff4b 100644
+--- a/crates/mh3u-gfx/src/overlay.rs
++++ b/crates/mh3u-gfx/src/overlay.rs
+@@ -126,6 +126,12 @@ pub struct Overlay {
+     /// The software keyboard's text being typed, and whether the overlay was opened for it (closed again when it is done).
+     kb_text: String,
+     kb_opened: bool,
++    /// On-screen FPS counter.
++    fps_enabled: bool,
++    fps_last_time: Instant,
++    fps_frame_count: u32,
++    fps_current: f32,
++    start_time: Instant,
+ }
+ 
+ /// Why there is no hunter while the game is not in play.
+@@ -191,6 +197,11 @@ impl Overlay {
+             f10: 0,
+             kb_text: String::new(),
+             kb_opened: false,
++            fps_enabled: std::env::var_os("MH3U_FPS").is_some(),
++            fps_last_time: Instant::now(),
++            fps_frame_count: 0,
++            fps_current: 0.0,
++            start_time: Instant::now(),
+         }
+     }
+ 
+@@ -199,7 +210,7 @@ impl Overlay {
+     pub fn frame(
+         &mut self,
+         device: &wgpu::Device,
+-        queue: &wgpu::Queue,
++        queue: &crate::queue::OrderedQueue,
+         enc: &mut wgpu::CommandEncoder,
+         view: &wgpu::TextureView,
+         format: wgpu::TextureFormat,
+@@ -211,8 +222,17 @@ impl Overlay {
+             OVERLAY_PRESSES.lock().unwrap_or_else(|e| e.into_inner()).clear();
+         }
+         self.frame += 1;
++        if self.fps_enabled {
++            self.fps_frame_count += 1;
++            let elapsed = self.fps_last_time.elapsed().as_secs_f32();
++            if elapsed >= 0.5 {
++                self.fps_current = self.fps_frame_count as f32 / elapsed;
++                self.fps_frame_count = 0;
++                self.fps_last_time = Instant::now();
++            }
++        }
+         // the game asks for text (a hunter's name): the overlay opens with its keyboard window
+-        if mh3u_rt::swkbd::waiting() && !self.open && !self.kb_opened {
++        if mh3u_rt::swkbd::waiting() && !self.open {
+             self.kb_opened = true;
+             self.kb_text.clear();
+             self.open = true;
+@@ -222,13 +242,17 @@ impl Overlay {
+             self.open = false;
+             OVERLAY_OPEN.store(false, Relaxed);
+         }
+-        // the save is followed while the overlay is open, now and then for a wishlist, and always for the live watch (PR #17 run:
+-        // with an empty wishlist and the overlay never opened, F10 found no save to search from)
+-        if self.open || mods::watching_live() || (self.kept && self.frame.is_multiple_of(LOOK_EVERY)) {
++        // the save is followed while the overlay is open, for the native in-game menu/text, now and then for a wishlist, and always for live watch
++        if self.open
++            || mods::watching_live()
++            || mh3u_rt::native_menu::enabled()
++            || mh3u_rt::native_text::enabled()
++            || (self.kept && self.frame.is_multiple_of(LOOK_EVERY))
++        {
+             self.follow_save();
+         }
+         self.notices.retain(|(_, t)| t.elapsed() < NOTICE);
+-        if !self.open && self.notices.is_empty() {
++        if !self.open && self.notices.is_empty() && !self.fps_enabled {
+             // nothing to draw: the window's size and scale are kept, its events are not wanted
+             let pending = INPUT.lock().unwrap_or_else(|e| e.into_inner()).take();
+             next_input(pending, &mut self.last_input);
+@@ -490,7 +514,7 @@ impl Overlay {
+     fn draw(
+         &mut self,
+         device: &wgpu::Device,
+-        queue: &wgpu::Queue,
++        queue: &crate::queue::OrderedQueue,
+         enc: &mut wgpu::CommandEncoder,
+         view: &wgpu::TextureView,
+         format: wgpu::TextureFormat,
+@@ -499,6 +523,8 @@ impl Overlay {
+         let ctx = CONTEXT.clone();
+         let pending = INPUT.lock().unwrap_or_else(|e| e.into_inner()).take();
+         let mut raw = next_input(pending, &mut self.last_input);
++        raw.time = Some(self.start_time.elapsed().as_secs_f64());
++        raw.predicted_dt = 1.0 / 60.0;
+         if !self.open {
+             // the notices only: no input for them
+             raw.events.clear();
+@@ -528,7 +554,13 @@ impl Overlay {
+                 button::DOWN => raw.events.push(key(egui::Key::Tab, false)),
+                 button::UP => raw.events.push(key(egui::Key::Tab, true)),
+                 button::A => raw.events.push(key(egui::Key::Enter, false)),
+-                button::B => OVERLAY_TOGGLE.store(true, Relaxed),
++                button::B => {
++                    if mh3u_rt::swkbd::waiting() {
++                        mh3u_rt::swkbd::submit(None);
++                    } else {
++                        OVERLAY_TOGGLE.store(true, Relaxed);
++                    }
++                }
+                 _ => {}
+             }
+         }
+@@ -579,6 +611,35 @@ impl Overlay {
+     }
+ 
+     fn ui(&mut self, ctx: &egui::Context) {
++        if self.fps_enabled {
++            ctx.request_repaint();
++            let upscaler_tag = match std::env::var("MH3U_UPSCALER").ok().as_deref().map(str::to_lowercase) {
++                Some(ref s) if s == "fsr" => " • FSR 1.0",
++                Some(ref s) if s == "cas" => " • CAS",
++                _ => "",
++            };
++            egui::Area::new(egui::Id::new("fps_hud"))
++                .anchor(egui::Align2::LEFT_TOP, egui::vec2(16.0, 16.0))
++                .order(egui::Order::Foreground)
++                .interactable(false)
++                .show(ctx, |ui| {
++                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
++                    egui::Frame::popup(ui.style())
++                        .fill(egui::Color32::from_black_alpha(190))
++                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(0x3e, 0x44, 0x51)))
++                        .show(ui, |ui| {
++                            ui.horizontal(|ui| {
++                                ui.label(
++                                    egui::RichText::new(format!("{:.0} FPS{}", self.fps_current, upscaler_tag))
++                                        .color(egui::Color32::from_rgb(0x98, 0xc3, 0x79))
++                                        .size(14.0)
++                                        .monospace()
++                                        .strong(),
++                                );
++                            });
++                        });
++                });
++        }
+         for (k, (text, _)) in self.notices.iter().enumerate() {
+             egui::Area::new(egui::Id::new(("notice", k)))
+                 .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 16.0 + 40.0 * k as f32))
+diff --git a/crates/mh3u-gfx/src/queue.rs b/crates/mh3u-gfx/src/queue.rs
+new file mode 100644
+index 0000000..47a2faf
+--- /dev/null
++++ b/crates/mh3u-gfx/src/queue.rs
+@@ -0,0 +1,142 @@
++//! The GPU queue, with its CPU-heavy part on a thread of its own.
++//!
++//! wgpu does most of a batch's CPU work when its encoder is finished (checking, tracking and the backend's commands) and when the queue
++//! submits and presents. None of that reads guest memory, so it can run beside the game's code: this queue takes the batches (encoders
++//! not yet finished), the buffer writes, the submits and the presents in the order the game's thread makes them, and a thread finishes and
++//! does them in that order. Whatever the queue does not wrap (`write_texture` into a texture just made, say) reaches the real queue at
++//! once through `Deref`; those writes are into resources no earlier batch uses.
++//!
++//! `MH3U_GFX_THREAD=off` does everything on the calling thread, as before.
++
++use std::ops::Deref;
++use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
++use std::sync::{Arc, Condvar, Mutex};
++
++enum Op {
++    Write(wgpu::Buffer, u64, Vec<u8>),
++    Submit(Vec<wgpu::CommandBuffer>),
++    Encode(Vec<wgpu::CommandEncoder>),
++    Present(wgpu::SurfaceTexture),
++    Barrier(std::sync::mpsc::Sender<()>),
++}
++
++/// Frames handed to the thread to present and not presented yet.
++type Presents = Arc<(Mutex<u32>, Condvar)>;
++
++#[derive(Clone)]
++pub struct OrderedQueue {
++    raw: wgpu::Queue,
++    tx: Option<SyncSender<Op>>,
++    presents: Presents,
++}
++
++impl Deref for OrderedQueue {
++    type Target = wgpu::Queue;
++    fn deref(&self) -> &wgpu::Queue {
++        &self.raw
++    }
++}
++
++impl OrderedQueue {
++    pub fn new(raw: wgpu::Queue, threaded: bool) -> OrderedQueue {
++        let presents: Presents = Arc::new((Mutex::new(0), Condvar::new()));
++        let threaded = threaded && std::env::var("MH3U_GFX_THREAD").map_or(true, |v| v != "off");
++        let tx = threaded.then(|| {
++            // a few batches' worth: the game's thread waits here if the queue's thread is far behind
++            let (tx, rx) = sync_channel(256);
++            let (raw, presents) = (raw.clone(), presents.clone());
++            std::thread::Builder::new()
++                .name("mh3u gpu queue".into())
++                .spawn(move || run(raw, rx, presents))
++                .expect("the GPU queue thread");
++            eprintln!("[gfx] GPU queue on its own thread (MH3U_GFX_THREAD=off to use the game's)");
++            tx
++        });
++        OrderedQueue { raw, tx, presents }
++    }
++
++    fn send(&self, op: Op) {
++        self.tx
++            .as_ref()
++            .expect("a threaded queue")
++            .send(op)
++            .expect("the GPU queue thread stopped");
++    }
++
++    pub fn write_buffer(&self, buffer: &wgpu::Buffer, offset: u64, data: &[u8]) {
++        if self.tx.is_some() {
++            self.send(Op::Write(buffer.clone(), offset, data.to_vec()));
++        } else {
++            self.raw.write_buffer(buffer, offset, data);
++        }
++    }
++
++    pub fn submit<I: IntoIterator<Item = wgpu::CommandBuffer>>(&self, buffers: I) {
++        if self.tx.is_some() {
++            self.send(Op::Submit(buffers.into_iter().collect()));
++        } else {
++            self.raw.submit(buffers);
++        }
++    }
++
++    /// Finishes the encoders and submits what they made: the part of a batch that costs the CPU most.
++    pub fn encode_and_submit(&self, encoders: Vec<wgpu::CommandEncoder>) {
++        if self.tx.is_some() {
++            self.send(Op::Encode(encoders));
++        } else {
++            self.raw.submit(encoders.into_iter().map(|e| e.finish()));
++        }
++    }
++
++    pub fn present(&self, frame: wgpu::SurfaceTexture) {
++        if self.tx.is_some() {
++            *self.presents.0.lock().unwrap() += 1;
++            self.send(Op::Present(frame));
++        } else {
++            self.raw.present(frame);
++        }
++    }
++
++    /// Waits until the frames handed over have been presented (the surface gives out its next texture only after that).
++    pub fn wait_presented(&self) {
++        if self.tx.is_some() {
++            let (count, done) = &*self.presents;
++            let mut n = count.lock().unwrap();
++            while *n > 0 {
++                n = done.wait(n).unwrap();
++            }
++        }
++    }
++
++    /// Waits until everything handed over so far has been done (before the game's thread reads or reconfigures what it touches).
++    pub fn flush(&self) {
++        if self.tx.is_some() {
++            let (tx, rx) = std::sync::mpsc::channel();
++            self.send(Op::Barrier(tx));
++            let _ = rx.recv();
++        }
++    }
++}
++
++fn run(raw: wgpu::Queue, rx: Receiver<Op>, presents: Presents) {
++    while let Ok(op) = rx.recv() {
++        match op {
++            Op::Write(buffer, offset, data) => raw.write_buffer(&buffer, offset, &data),
++            Op::Submit(buffers) => {
++                raw.submit(buffers);
++            }
++            Op::Encode(encoders) => {
++                raw.submit(encoders.into_iter().map(|e| e.finish()));
++            }
++            Op::Present(frame) => {
++                raw.present(frame);
++                let (count, done) = &*presents;
++                *count.lock().unwrap() -= 1;
++                done.notify_all();
++            }
++            Op::Barrier(reply) => {
++                let _ = reply.send(());
++            }
++        }
++    }
++}
+diff --git a/crates/mh3u-gfx/src/report.rs b/crates/mh3u-gfx/src/report.rs
+index db4c7a1..7e7b955 100644
+--- a/crates/mh3u-gfx/src/report.rs
++++ b/crates/mh3u-gfx/src/report.rs
+@@ -8,10 +8,11 @@
+ //!   `mh3u-frames` by default): `draws.txt` with every draw's state, `shaders/` with each shader's listing and WGSL, `textures/` with
+ //!   each texture the frame reads as a PNG, and the TV picture as `tv.png`. Small enough to zip and send.
+ 
++use crate::fxmap::{HashMap, HashSet};
+ use crate::state::State;
+ use crate::texture::{Header, Support, format_support};
+ use mh3u_rt::Guest;
+-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
++use std::collections::{BTreeMap, BTreeSet};
+ use std::fmt::Write as _;
+ use std::path::PathBuf;
+ use std::sync::Mutex;

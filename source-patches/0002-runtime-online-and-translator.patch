@@ -1,0 +1,1453 @@
+diff --git a/crates/mh3u-recomp/src/discover.rs b/crates/mh3u-recomp/src/discover.rs
+index 26efb42..65bdbb0 100644
+--- a/crates/mh3u-recomp/src/discover.rs
++++ b/crates/mh3u-recomp/src/discover.rs
+@@ -33,12 +33,13 @@ pub fn functions(base: u32, words: &[u32], pointers: &[u32], entry: u32) -> BTre
+     }
+     for (i, &w) in words.iter().enumerate() {
+         let Some(insn) = Insn::decode(w) else { continue };
+-        if insn.op == Op::B && insn.lk() {
++        if matches!(insn.op, Op::B | Op::Bc) && insn.lk() {
+             let addr = base + 4 * i as u32;
+-            let t = if insn.aa() {
+-                insn.li() as u32
+-            } else {
+-                addr.wrapping_add(insn.li() as u32)
++            let t = match (insn.op, insn.aa()) {
++                (Op::B, true) => insn.li() as u32,
++                (Op::B, false) => addr.wrapping_add(insn.li() as u32),
++                (_, true) => insn.bd() as u32,
++                (_, false) => addr.wrapping_add(insn.bd() as u32),
+             };
+             if inside(t) {
+                 set.insert(t);
+diff --git a/crates/mh3u-rt/src/cafe.rs b/crates/mh3u-rt/src/cafe.rs
+index f81ceff..e788a3b 100644
+--- a/crates/mh3u-rt/src/cafe.rs
++++ b/crates/mh3u-rt/src/cafe.rs
+@@ -25,7 +25,8 @@ pub fn find(name: &str) -> Option<Handler> {
+     if let Some(h) = crate::sync::find(name).or_else(|| crate::fs::find(name)) {
+         return Some(Handler::Kernel(h));
+     }
+-    simple(name)
++    crate::net::find(name)
++        .or_else(|| simple(name))
+         .or_else(|| crate::axfx::find(name))
+         .or_else(|| crate::gx2::find(name))
+         .map(Handler::Simple)
+@@ -33,6 +34,21 @@ pub fn find(name: &str) -> Option<Handler> {
+ 
+ fn simple(name: &str) -> Option<SimpleHandler> {
+     Some(match name {
++        "coreinit:DCFlushRange" | "coreinit:DCTouchRange" | "coreinit:DCInvalidateRange" | "coreinit:DCStoreRange" => |_, _, c| {
++            c.r[3] = 0;
++        },
++        "coreinit:OSEnableHomeButtonMenu" => |_, _, c| {
++            c.r[3] = 0;
++        },
++        "usb_mic.rpl:USBMICInit" => |_, _, c| {
++            c.r[3] = 0;
++        },
++        "vpad.rpl:VPADGetLcdMode" => |_, g, c| {
++            if c.r[4] != 0 {
++                g.put_u32(c.r[4], 0);
++            }
++            c.r[3] = 0;
++        },
+         "coreinit:memset" => |_, g, c| {
+             g.fill(c.r[3], c.r[4] as u8, c.r[5]);
+         },
+@@ -122,6 +138,10 @@ fn simple(name: &str) -> Option<SimpleHandler> {
+             c.r[3] = 0;
+         },
+         "nn_ac:Connect__Q2_2nn2acFv" => |_, _, c| c.r[3] = 0xffff_ffff,
++        // local wireless (UDS): return error code so the game aborts cleanly with dismissable message without freezing
++        s if s.starts_with("nn_uds:") => |_, _, c| c.r[3] = 0xffff_ffff,
++        s if s.starts_with("nn_ndm:") => |_, _, c| c.r[3] = 0,
++        s if s.starts_with("nn_fp:") || s.starts_with("nsysnet.rpl:") || s.starts_with("nlibcurl.rpl:") => |_, _, c| c.r[3] = 0,
+         // the audio system (`AX`): the voices' settings go to the mixer (`mh3u-audio`), which the audio thread runs every 3 ms frame
+         // (`game::spawn_audio`); `AXInit*` and the frame callbacks are in `sync.rs`
+         "snd_core.rpl:AXAcquireVoice" | "snd_core.rpl:AXAcquireVoiceEx" => |os, g, c| {
+@@ -330,6 +350,7 @@ fn simple(name: &str) -> Option<SimpleHandler> {
+         },
+         // the GamePad: one sample of what the player presses (see `input`), with the buttons `MH3U_PRESS` holds added
+         "vpad.rpl:VPADRead" => |os, g, c| {
++            crate::net::tick_login(g);
+             let (buffer, error) = (c.r[4], c.r[6]);
+             g.fill(buffer, 0, 0xac);
+             let input = &crate::input::INPUT;
+diff --git a/crates/mh3u-rt/src/game.rs b/crates/mh3u-rt/src/game.rs
+index d2b9657..7cd2a7f 100644
+--- a/crates/mh3u-rt/src/game.rs
++++ b/crates/mh3u-rt/src/game.rs
+@@ -169,6 +169,16 @@ extern "C" fn import(c: *mut Ctx, number: u32) {
+             }
+             // a function that is not written yet does nothing and returns 0
+             None => {
++                use std::collections::HashSet;
++                use std::sync::Mutex;
++                static LOGGED: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
++                if let Ok(mut guard) = LOGGED.lock() {
++                    let set = guard.get_or_insert_with(HashSet::new);
++                    if set.insert(number) {
++                        let name = &k.report.names[number as usize];
++                        eprintln!("[unhandled import #{number}] {name} called from {:#x}", c.lr);
++                    }
++                }
+                 c.r[3] = 0;
+                 Step::Done
+             }
+@@ -241,7 +251,29 @@ extern "C" fn unknown_call(c: *mut Ctx, target: u32) {
+             return;
+         }
+     }
+-    stop(c, format!("a call to {target:#x}, which is not a translated function"));
++    // Handle untranslated thunks in original binary
++    match target {
++        0x02e8_afcc => {
++            // lis r3, 0x20c9; addi r3, r3, -15341; b 0x2e8afa4
++            unsafe {
++                (*c).r[3] = 0x20c8_c413;
++                let mem = (*c).mem;
++                let p = mem.add(0x102e_b8ec) as *mut u32;
++                let val = u32::from_be(std::ptr::read_unaligned(p));
++                std::ptr::write_unaligned(p, (val | 0x20c8_c413).to_be());
++            }
++            return;
++        }
++        0x02e8_afd8 => {
++            // li r3, 0; b 0x2e8afa4 (or with 0 is no-op)
++            unsafe {
++                (*c).r[3] = 0;
++            }
++            return;
++        }
++        _ => {}
++    }
++    stop(c, format!("a call to {target:#x}, which is not a translated function (game.dll was built by an older translator: rebuild it from the launcher)"));
+ }
+ 
+ extern "C" fn trap(c: *mut Ctx, word: u32) {
+@@ -602,50 +634,49 @@ pub fn run(library: &Path, pieces: &[Piece], options: Options) -> Result<Report>
+         k.backend = backend;
+     }
+     if let Some(secs) = std::env::var("MH3U_DUMP_AFTER").ok().and_then(|v| v.parse::<u64>().ok()) {
+-        // a look at what every thread is doing, for finding what the game is waiting for
++        // a recurring look at what every thread is doing, for finding what the game is waiting for
+         std::thread::spawn(move || {
+-            std::thread::sleep(std::time::Duration::from_secs(secs));
+-            let guard = lock();
+-            if let Some(k) = guard.as_ref() {
+-                for (i, t) in k.threads.iter().enumerate() {
+-                    let last = t.last.map(|(n, lr, sp)| {
+-                        // the saved link registers up the stack (the frame at `sp` holds its caller's frame, and the return address at +4)
+-                        let mut frames = vec![lr];
+-                        let mut frame = sp;
+-                        for _ in 0..14 {
+-                            let (back, ret) = (k.guest.u32(frame), k.guest.u32(frame.wrapping_add(4)));
+-                            if back <= frame || back < 0x1000_0000 || ret == 0 {
+-                                break;
++            loop {
++                std::thread::sleep(std::time::Duration::from_secs(secs));
++                let guard = lock();
++                if let Some(k) = guard.as_ref() {
++                    eprintln!("=== [MH3U THREAD DUMP] ===");
++                    for (i, t) in k.threads.iter().enumerate() {
++                        let last = t.last.map(|(n, lr, sp)| {
++                            // the saved link registers up the stack (the frame at `sp` holds its caller's frame, and the return address at +4)
++                            let mut frames = vec![lr];
++                            let mut frame = sp;
++                            for _ in 0..14 {
++                                let (back, ret) = (k.guest.u32(frame), k.guest.u32(frame.wrapping_add(4)));
++                                if back <= frame || back < 0x1000_0000 || ret == 0 {
++                                    break;
++                                }
++                                frames.push(ret);
++                                frame = back;
+                             }
+-                            frames.push(ret);
+-                            frame = back;
+-                        }
+-                        format!(
+-                            "{} from {}",
+-                            k.report.names[n as usize],
+-                            frames.iter().map(|f| format!("{f:#x}")).collect::<Vec<_>>().join(" < ")
+-                        )
+-                    });
+-                    println!(
+-                        "thread {i}: life {} suspend {} started {} addr {:#x} entry {:#x} current {} last {last:?}",
+-                        match t.life {
+-                            Life::Ready => "ready",
+-                            Life::Suspended => "suspended",
+-                            Life::Done => "done",
+-                        },
+-                        t.suspend,
+-                        t.started,
+-                        t.addr,
+-                        t.entry,
+-                        k.current == i
+-                    );
++                            format!(
++                                "{} from {}",
++                                k.report.names[n as usize],
++                                frames.iter().map(|f| format!("{f:#x}")).collect::<Vec<_>>().join(" < ")
++                            )
++                        });
++                        eprintln!(
++                            "thread {i}: life {} suspend {} started {} addr {:#x} entry {:#x} current {} last {last:?}",
++                            match t.life {
++                                Life::Ready => "ready",
++                                Life::Suspended => "suspended",
++                                Life::Done => "done",
++                            },
++                            t.suspend,
++                            t.started,
++                            t.addr,
++                            t.entry,
++                            k.current == i
++                        );
++                    }
++                    eprintln!("==========================");
+                 }
+             }
+-            if let Some(k) = guard.as_ref() {
+-                print_report(k, "the dump was asked for");
+-            }
+-            drop(guard);
+-            std::process::exit(0);
+         });
+     }
+     let host = Host {
+diff --git a/crates/mh3u-rt/src/guest.rs b/crates/mh3u-rt/src/guest.rs
+index d98d82f..48fa342 100644
+--- a/crates/mh3u-rt/src/guest.rs
++++ b/crates/mh3u-rt/src/guest.rs
+@@ -82,6 +82,11 @@ impl Guest {
+         b[0]
+     }
+ 
++    pub fn put_u8(&self, address: u32, v: u8) {
++        watched(address, 1, "put_u8");
++        self.write(address, &[v]);
++    }
++
+     pub fn u16(&self, address: u32) -> u16 {
+         let mut b = [0; 2];
+         self.read(address, &mut b);
+diff --git a/crates/mh3u-rt/src/kernel.rs b/crates/mh3u-rt/src/kernel.rs
+index 825c998..71f711b 100644
+--- a/crates/mh3u-rt/src/kernel.rs
++++ b/crates/mh3u-rt/src/kernel.rs
+@@ -86,6 +86,8 @@ pub struct Kernel {
+     /// The thread that holds the baton.
+     pub current: usize,
+     pub mutexes: HashMap<u32, MutexState>,
++    /// Condition variables: whether signaled.
++    pub conditions: HashMap<u32, bool>,
+     /// Events: whether set, and whether they reset themselves when a thread passes.
+     pub events: HashMap<u32, (bool, bool)>,
+     pub semaphores: HashMap<u32, i32>,
+@@ -274,6 +276,7 @@ impl Kernel {
+             by_addr,
+             current: 0,
+             mutexes: HashMap::new(),
++            conditions: HashMap::new(),
+             events: HashMap::new(),
+             semaphores: HashMap::new(),
+             queues: HashMap::new(),
+diff --git a/crates/mh3u-rt/src/lib.rs b/crates/mh3u-rt/src/lib.rs
+index 73054b2..c43b073 100644
+--- a/crates/mh3u-rt/src/lib.rs
++++ b/crates/mh3u-rt/src/lib.rs
+@@ -23,6 +23,7 @@ pub mod menu_probe;
+ pub mod mods;
+ pub mod native_menu;
+ pub mod native_text;
++pub mod net;
+ pub mod scene;
+ pub mod swkbd;
+ mod sync;
+diff --git a/crates/mh3u-rt/src/net.rs b/crates/mh3u-rt/src/net.rs
+new file mode 100644
+index 0000000..acc0fb3
+--- /dev/null
++++ b/crates/mh3u-rt/src/net.rs
+@@ -0,0 +1,1093 @@
++//! Network emulation layer for Cafe OS (nsysnet.rpl, nn_ac, nn_act, nn_fp).
++//! Handles socket redirection and online multiplayer for MH3U native PC port.
++//! Inspired by Matt-Wood-23/mh3u-revival architecture.
++
++use std::collections::BTreeMap;
++use std::io::{ErrorKind, Read, Write};
++use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, UdpSocket};
++use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
++use std::sync::{Mutex, OnceLock};
++
++use crate::cafe::SimpleHandler;
++use crate::guest::Guest;
++
++pub static IS_LOGGED_IN: AtomicBool = AtomicBool::new(false);
++pub static PENDING_LOGIN_NET_MGR: AtomicU32 = AtomicU32::new(0);
++
++pub fn tick_login(g: &Guest) {
++    let pending = PENDING_LOGIN_NET_MGR.load(Ordering::SeqCst);
++    if pending != 0 {
++        let state = g.u8(pending + 0x7b85);
++        if state == 2 {
++            // State 2 = waiting for async login callback.
++            // Transition state to 3 (success), allowing the game's state machine
++            // to execute L_030bc088 which completes the login request and unlocks Tanzia online.
++            g.put_u8(pending + 0x7b85, 3);
++            IS_LOGGED_IN.store(true, Ordering::SeqCst);
++            PENDING_LOGIN_NET_MGR.store(0, Ordering::SeqCst);
++            eprintln!("[online] nn_fp:LoginAsync callback completed -> transitioned state to 3 (success) for net_mgr={:#x}", pending);
++        }
++    }
++}
++
++pub enum HostSocket {
++    Tcp(TcpStream),
++    Udp(UdpSocket),
++    UnboundUdp,
++    UnboundTcp,
++}
++
++pub struct NetManager {
++    next_fd: i32,
++    sockets: BTreeMap<i32, HostSocket>,
++    pub last_err: i32,
++    /// Per socket, every (original destination, redirected destination) pair it has sent to.
++    pub nat_mappings: BTreeMap<i32, Vec<(SocketAddrV4, SocketAddrV4)>>,
++}
++
++impl NetManager {
++    pub const fn new() -> Self {
++        Self {
++            next_fd: 3,
++            sockets: BTreeMap::new(),
++            last_err: 0,
++            nat_mappings: BTreeMap::new(),
++        }
++    }
++
++    pub fn alloc_fd(&mut self, sock: HostSocket) -> i32 {
++        let fd = self.next_fd;
++        self.next_fd += 1;
++        self.sockets.insert(fd, sock);
++        fd
++    }
++
++    pub fn close(&mut self, fd: i32) -> i32 {
++        self.nat_mappings.remove(&fd);
++        if self.sockets.remove(&fd).is_some() {
++            0
++        } else {
++            -1
++        }
++    }
++}
++
++pub static NET: Mutex<NetManager> = Mutex::new(NetManager::new());
++
++fn configure_udp(u: &UdpSocket) {
++    let _ = u.set_nonblocking(true);
++    #[cfg(windows)]
++    {
++        use std::os::windows::io::AsRawSocket;
++        const SIO_UDP_CONNRESET: u32 = 0x9800000c;
++        unsafe extern "system" {
++            fn WSAIoctl(
++                s: usize,
++                dwIoControlCode: u32,
++                lpvInBuffer: *const std::ffi::c_void,
++                cbInBuffer: u32,
++                lpvOutBuffer: *mut std::ffi::c_void,
++                cbOutBuffer: u32,
++                lpcbBytesReturned: *mut u32,
++                lpOverlapped: *mut std::ffi::c_void,
++                lpCompletionRoutine: *mut std::ffi::c_void,
++            ) -> i32;
++        }
++        let handle = u.as_raw_socket() as usize;
++        let mut bytes_ret: u32 = 0;
++        let b_new_behavior: u32 = 0;
++        unsafe {
++            WSAIoctl(
++                handle,
++                SIO_UDP_CONNRESET,
++                &b_new_behavior as *const _ as *const _,
++                std::mem::size_of::<u32>() as u32,
++                std::ptr::null_mut(),
++                0,
++                &mut bytes_ret,
++                std::ptr::null_mut(),
++                std::ptr::null_mut(),
++            );
++        }
++    }
++}
++
++fn is_online_enabled() -> bool {
++    std::env::var_os("MH3U_ONLINE_ENABLED")
++        .map(|v| v != "0" && v != "off" && v != "false")
++        .unwrap_or(true)
++}
++
++fn get_online_server() -> String {
++    std::env::var("MH3U_ONLINE_SERVER").unwrap_or_else(|_| "127.0.0.1".into())
++}
++
++/// IP that peers should use to reach this machine (Radmin/VPN/LAN). Falls back to the server IP.
++/// Per-packet P2P gameplay logging is costly (thousands of stderr writes);
++/// only on with `MH3U_NET_TRACE=1`. Server ports (1223/1224/10025) always log.
++fn net_trace(port: u16) -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    matches!(port, 1223 | 1224 | 10025 | 33335)
++        || *ON.get_or_init(|| std::env::var("MH3U_NET_TRACE").map_or(false, |v| v == "1"))
++}
++
++fn get_local_ip() -> Ipv4Addr {
++    std::env::var("MH3U_LOCAL_IP")
++        .ok()
++        .and_then(|s| s.trim().parse::<Ipv4Addr>().ok())
++        .filter(|ip| !ip.is_unspecified())
++        .unwrap_or_else(|| {
++            get_online_server()
++                .parse()
++                .unwrap_or(Ipv4Addr::new(127, 0, 0, 1))
++        })
++}
++
++fn get_online_port() -> u16 {
++    std::env::var("MH3U_ONLINE_PORT")
++        .ok()
++        .and_then(|p| p.parse().ok())
++        .unwrap_or(9876)
++}
++
++fn get_hunter_name() -> String {
++    std::env::var("MH3U_HUNTER_NAME")
++        .or_else(|_| std::env::var("MH3U_SWKBD_TEXT"))
++        .unwrap_or_else(|_| "Hunter".into())
++}
++
++fn get_principal_id() -> u32 {
++    // Salt with the machine name so two friends using the same hunter name get distinct PIDs
++    // (the server keeps one live session per PID and evicts the older one).
++    let name = format!(
++        "{}@{}",
++        get_hunter_name(),
++        std::env::var("COMPUTERNAME").unwrap_or_default()
++    );
++    let hash = name
++        .bytes()
++        .fold(0x4000_1234u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
++    (hash & 0x2fff_ffff) | 0x4000_0000
++}
++
++fn read_sockaddr(g: &Guest, addr_ptr: u32) -> Option<SocketAddrV4> {
++    if addr_ptr == 0 {
++        return None;
++    }
++    let port = g.u16(addr_ptr + 2);
++    let ip_val = g.u32(addr_ptr + 4);
++    let ip = Ipv4Addr::from(ip_val);
++    Some(SocketAddrV4::new(ip, port))
++}
++
++fn write_sockaddr(g: &Guest, addr_ptr: u32, addrlen_ptr: u32, sa: SocketAddrV4) {
++    if addr_ptr != 0 {
++        g.write(addr_ptr, &[16, 2]); // sin_len = 16, sin_family = AF_INET (2)
++        g.put_u16(addr_ptr + 2, sa.port());
++        let ip_bytes = sa.ip().octets();
++        g.write(addr_ptr + 4, &ip_bytes);
++        g.fill(addr_ptr + 8, 0, 8);
++    }
++    if addrlen_ptr != 0 {
++        g.put_u32(addrlen_ptr, 16);
++    }
++}
++
++fn send_logged(u: &UdpSocket, buf: &[u8], to: SocketAddrV4, len: usize) -> usize {
++    match u.send_to(buf, SocketAddr::V4(to)) {
++        Ok(n) => n,
++        Err(e) => {
++            eprintln!("[net] sendto {to} failed: {e}");
++            len
++        }
++    }
++}
++
++fn redirect_dest(dest: SocketAddrV4) -> SocketAddrV4 {
++    if !is_online_enabled() {
++        return dest;
++    }
++    let server_ip: Ipv4Addr = get_online_server()
++        .parse()
++        .unwrap_or(Ipv4Addr::new(127, 0, 0, 1));
++    let server_port = get_online_port();
++
++    // 1. Port 1223: Authentication Server (Nintendo hardcoded/DNS) -> route to server_ip
++    if dest.port() == 1223 {
++        return SocketAddrV4::new(server_ip, 1223);
++    }
++
++    // 2. Ports 10025 & 33335: NATCheck / Traversal Server -> route to server_ip:10025
++    if dest.port() == 10025 || dest.port() == 33335 {
++        return SocketAddrV4::new(server_ip, 10025);
++    }
++
++    // 3a. The NEX server runs on this machine (host): its secure port is always reached over
++    //     loopback, whatever address the ticket advertises (our own VPN IP is not reliable for
++    //     local delivery).
++    if dest.port() == 1224 && server_ip.is_loopback() {
++        return SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1224);
++    }
++
++    // 3. Port 1224: Secure Matchmaking Server
++    // If ticket gave loopback and server is loopback, keep loopback!
++    // If ticket gave loopback, but server is remote, route to server_ip:1224!
++    if dest.port() == 1224 {
++        if dest.ip().is_unspecified() || (dest.ip().is_loopback() && !server_ip.is_loopback()) {
++            return SocketAddrV4::new(server_ip, 1224);
++        } else {
++            return dest;
++        }
++    }
++
++    // 4. Custom online port
++    if dest.port() == server_port {
++        return SocketAddrV4::new(server_ip, server_port);
++    }
++
++    // 5. Unspecified (0.0.0.0) or loopback StationURLs published by the host (it reaches the
++    //    server over 127.0.0.1) -> route to server_ip, which is the host's reachable address.
++    if dest.ip().is_unspecified() || (dest.ip().is_loopback() && !server_ip.is_loopback()) {
++        return SocketAddrV4::new(server_ip, dest.port());
++    }
++
++    dest
++}
++
++/// Look up a networking import by name.
++pub fn find(name: &str) -> Option<SimpleHandler> {
++    Some(match name {
++        // --- nn_ac (Network Connection) ---
++        "nn_ac:Initialize__Q2_2nn2acFv" | "nn_ac:Finalize__Q2_2nn2acFv" | "nn_ac:Close__Q2_2nn2acFv" => {
++            |_, _, c| c.r[3] = 0
++        }
++        "nn_ac:IsApplicationConnected__Q2_2nn2acFPb" => |_, g, c| {
++            let online = is_online_enabled();
++            g.fill(c.r[3], if online { 1 } else { 0 }, 1);
++            c.r[3] = 0;
++        },
++        "nn_ac:Connect__Q2_2nn2acFv" => |_, _, c| {
++            c.r[3] = if is_online_enabled() { 0 } else { 0xffff_ffff };
++        },
++        "nn_ac:GetAssignedAddress__Q2_2nn2acFPUl" => |_, g, c| {
++            eprintln!(
++                "[online] local ip {} (MH3U_LOCAL_IP), server {} (MH3U_ONLINE_SERVER)",
++                get_local_ip(),
++                get_online_server()
++            );
++            g.put_u32(c.r[3], u32::from_be_bytes(get_local_ip().octets()));
++            c.r[3] = 0;
++        },
++        "nn_ac:GetAssignedSubnet__Q2_2nn2acFPUl" => |_, g, c| {
++            g.put_u32(c.r[3], 0xffff_ff00);
++            c.r[3] = 0;
++        },
++        "nn_ac:GetLastErrorCode__Q2_2nn2acFPUi" => |_, g, c| {
++            g.put_u32(c.r[3], 0);
++            c.r[3] = 0;
++        },
++        "nn_ac:GetMacAddress__Q2_2nn2acFPQ3_2nn2ac10MacAddress" => |_, g, c| {
++            g.write(c.r[3], &[0x00, 0x1f, 0x32, 0x11, 0x22, 0x33]);
++            c.r[3] = 0;
++        },
++        "nn_ac:GetStartupId__Q2_2nn2acFPQ3_2nn2ac11ConfigIdNum" => |_, g, c| {
++            g.put_u32(c.r[3], 1);
++            c.r[3] = 0;
++        },
++        "nn_ac:IsConfigExisting__Q2_2nn2acFQ3_2nn2ac11ConfigIdNumPb" => |_, g, c| {
++            g.fill(c.r[4], 1, 1);
++            c.r[3] = 0;
++        },
++        "nn_ac:ReadConfig__Q2_2nn2acFQ3_2nn2ac11ConfigIdNumP16netconf_profile_" => |_, _, c| c.r[3] = 0,
++        "nn_ac:GetNetworkInterface__Q2_2nn2acFPC16netconf_profile_" => |_, _, c| c.r[3] = 1,
++
++        // --- nn_act (Account & NEX Authentication Tokens) ---
++        "nn_act:Initialize__Q2_2nn3actFv" | "nn_act:Finalize__Q2_2nn3actFv" => |_, _, c| c.r[3] = 0,
++        "nn_act:GetSlotNo__Q2_2nn3actFv" | "nn_act:GetNumOfAccounts__Q2_2nn3actFv" => |_, _, c| c.r[3] = 1,
++        "nn_act:IsSlotOccupied__Q2_2nn3actFUc" => |_, _, c| c.r[3] = 1,
++        "nn_act:GetPersistentId__Q2_2nn3actFv" => |_, _, c| c.r[3] = 0x8000_0001,
++        "nn_act:HasNfsAccount__Q2_2nn3actFv" => |_, _, c| {
++            c.r[3] = if is_online_enabled() { 1 } else { 0 };
++        },
++        "nn_act:GetPrincipalId__Q2_2nn3actFv" => |_, _, c| {
++            c.r[3] = get_principal_id();
++        },
++        "nn_act:GetPrincipalIdEx__Q2_2nn3actFPUiUc" => |_, g, c| {
++            g.put_u32(c.r[3], get_principal_id());
++            c.r[3] = 0;
++        },
++        "nn_act:GetAccountId__Q2_2nn3actFPc" => |_, g, c| {
++            let name = get_hunter_name();
++            let mut bytes = name.into_bytes();
++            bytes.truncate(16);
++            bytes.push(0);
++            g.write(c.r[3], &bytes);
++            c.r[3] = 0;
++        },
++        "nn_act:GetMii__Q2_2nn3actFP12FFLStoreData" => |_, g, c| {
++            g.fill(c.r[3], 0, 96);
++            c.r[3] = 0;
++        },
++        "nn_act:GetNfsPasswordEx__Q2_2nn3actFPcUc" => |_, g, c| {
++            if c.r[3] != 0 {
++                g.write(c.r[3], b"mh3u_revival_pw\0");
++            }
++            c.r[3] = 0;
++        },
++        "nn_act:GetHostServerSettings__Q2_2nn3actFP11ACTNnasTypeP10ACTNfsTypePUcUc" => |_, g, c| {
++            if c.r[3] != 0 {
++                g.put_u32(c.r[3], 0);
++            }
++            if c.r[4] != 0 {
++                g.put_u32(c.r[4], 0);
++            }
++            if c.r[5] != 0 {
++                g.fill(c.r[5], 0, 1);
++            }
++            c.r[3] = 0;
++        },
++        "nn_act:GetTransferableId__Q2_2nn3actFUi" => |_, _, c| {
++            c.r[3] = 0x0000_0001;
++            c.r[4] = get_principal_id();
++        },
++        "nn_act:AcquireIndependentServiceToken__Q2_2nn3actFPcPCc" => |_, g, c| {
++            if c.r[3] != 0 {
++                g.write(c.r[3], b"mh3u_revival_token\0");
++            }
++            c.r[3] = 0;
++        },
++        "nn_act:AcquireNexServiceToken__Q2_2nn3actFP26ACTNexAuthenticationResultUi" => |_, g, c| {
++            let token_ptr = c.r[3];
++            let server_id = c.r[4];
++            if is_online_enabled() {
++                // 0x25C byte layout from Matt Wood / Cemu reverse engineering
++                g.fill(token_ptr, 0, 0x25c);
++                g.write(token_ptr, b"mh3u_revival_token\0");
++                g.write(token_ptr + 0x204, b"mh3u_revival_pw\0");
++
++                let server_host = get_online_server();
++                let mut host_bytes = server_host.into_bytes();
++                host_bytes.truncate(15);
++                host_bytes.push(0);
++                g.write(token_ptr + 0x248, &host_bytes);
++
++                // Port 1223 is the standard RendezVous / Quazal authentication server port
++                let auth_port = 1223u16;
++                g.put_u16(token_ptr + 0x258, auth_port);
++
++                eprintln!(
++                    "[online] nn_act:AcquireNexServiceToken redirected serverId={server_id:#x} -> {}:{}",
++                    String::from_utf8_lossy(&host_bytes),
++                    auth_port
++                );
++                c.r[3] = 0; // Success
++            } else {
++                c.r[3] = 0x8000_0000; // Failure
++            }
++        },
++        "nn_act:GetErrorCode__Q2_2nn3actFRCQ2_2nn6Result" => |_, _, c| c.r[3] = 0,
++
++        // --- nn_fp (Friends & Presence) ---
++        "nn_fp:Initialize__Q2_2nn2fpFv" | "nn_fp:Finalize__Q2_2nn2fpFv" => |_, _, c| c.r[3] = 0,
++        "nn_fp:IsInitialized__Q2_2nn2fpFv" => |_, _, c| c.r[3] = 1,
++        "nn_fp:HasLoggedIn__Q2_2nn2fpFv" => |_, _, c| {
++            c.r[3] = if IS_LOGGED_IN.load(Ordering::SeqCst) { 1 } else { 0 };
++        },
++        "nn_fp:GetMyPrincipalId__Q2_2nn2fpFv" => |_, _, c| {
++            c.r[3] = get_principal_id();
++        },
++        "nn_fp:GetMyAccountId__Q2_2nn2fpFPc" => |_, g, c| {
++            let name = get_hunter_name();
++            let mut bytes = name.into_bytes();
++            bytes.truncate(16);
++            bytes.push(0);
++            g.write(c.r[3], &bytes);
++            c.r[3] = 0;
++        },
++        "nn_fp:GetMyScreenName__Q2_2nn2fpFPw" => |_, g, c| {
++            if c.r[3] != 0 {
++                let name = get_hunter_name();
++                let mut utf16_be = Vec::new();
++                for ch in name.encode_utf16().take(10) {
++                    utf16_be.extend_from_slice(&ch.to_be_bytes());
++                }
++                utf16_be.extend_from_slice(&[0, 0]);
++                g.write(c.r[3], &utf16_be);
++            }
++            c.r[3] = 0;
++        },
++        "nn_fp:GetMyProfile__Q2_2nn2fpFPQ3_2nn2fp7Profile" => |_, g, c| {
++            if c.r[3] != 0 {
++                g.fill(c.r[3], 0, 4);
++            }
++            c.r[3] = 0;
++        },
++        "nn_fp:GetMyPresence__Q2_2nn2fpFPQ3_2nn2fp10MyPresence" => |_, g, c| {
++            if c.r[3] != 0 {
++                g.fill(c.r[3], 0, 32);
++                g.put_u32(c.r[3] + 8, get_principal_id());
++            }
++            c.r[3] = 0;
++        },
++        "nn_fp:GetMyMii__Q2_2nn2fpFP12FFLStoreData" => |_, g, c| {
++            g.fill(c.r[3], 0, 96);
++            c.r[3] = 0;
++        },
++        "nn_fp:GetFriendList__Q2_2nn2fpFPUiT1UiT3" => |_, g, c| {
++            if c.r[4] != 0 {
++                g.put_u32(c.r[4], 0);
++            }
++            c.r[3] = 0;
++        },
++        "nn_fp:IsJoinable__Q2_2nn2fpFPCQ3_2nn2fp14FriendPresenceUL" => |_, _, c| c.r[3] = 1,
++        "nn_fp:LoginAsync__Q2_2nn2fpFPFQ2_2nn6ResultPv_vPv" => |_, _, c| {
++            let net_mgr = c.r[4];
++            if net_mgr != 0 {
++                PENDING_LOGIN_NET_MGR.store(net_mgr, Ordering::SeqCst);
++                eprintln!("[online] nn_fp:LoginAsync called for net_mgr={:#x}, queued async completion", net_mgr);
++            }
++            c.r[3] = 0;
++        },
++        "nn_fp:Logout__Q2_2nn2fpFv" => |_, _, c| {
++            IS_LOGGED_IN.store(false, Ordering::SeqCst);
++            c.r[3] = 0;
++        },
++        "nn_fp:RegisterAccountAsync__Q2_2nn2fpFPFQ2_2nn6ResultPv_vPv" => |_, _, c| {
++            c.r[3] = 0;
++        },
++        "nn_fp:ResultToErrorCode__Q2_2nn2fpFQ2_2nn6Result" => |_, _, c| c.r[3] = 0,
++        "nn_fp:SetNotificationHandler__Q2_2nn2fpFUiPFQ3_2nn2fp16NotificationTypeUiPv_vPv" => |_, _, c| c.r[3] = 0,
++        "nn_fp:UpdateGameMode__Q2_2nn2fpFPCQ3_2nn2fp8GameModePCw" => |_, _, c| c.r[3] = 0,
++        s if s.starts_with("nn_fp:") => |_, _, c| c.r[3] = 0,
++
++        // --- nn_ndm (Network Daemon Manager) ---
++        "nn_ndm:Initialize__Q2_2nn3ndmFv"
++        | "nn_ndm:Finalize__Q2_2nn3ndmFv"
++        | "nn_ndm:EnableConcurrentConnection__Q2_2nn3ndmFv"
++        | "nn_ndm:ResumeDaemons__Q2_2nn3ndmFUi"
++        | "nn_ndm:SuspendDaemons__Q2_2nn3ndmFUi" => |_, _, c| c.r[3] = 0,
++
++        // --- nn_acp (Application & Account Control System) ---
++        "nn_acp:ACPGetNetworkTime" => |_, g, c| {
++            if c.r[3] != 0 {
++                g.put_u32(c.r[3], 0x1000_0000);
++                g.put_u32(c.r[3] + 4, 0);
++            }
++            c.r[3] = 0;
++        },
++        "nn_acp:ACPConvertNetworkTimeToOSCalendarTime" => |_, _, c| c.r[3] = 0,
++
++        // --- sysapp (System Applications) ---
++        "sysapp:SYSLaunchAccount" | "sysapp:SYSLaunchSettings" => |_, _, c| c.r[3] = 0,
++
++        // --- nn_uds (Local 3DS Wireless Bridge) ---
++        // Returning error code (0xffff_ffff) allows the game to cleanly pop a dismissable error dialog instead of freezing
++        s if s.starts_with("nn_uds:") => |_, _, c| c.r[3] = 0xffff_ffff,
++
++        // --- nsysnet.rpl (BSD Socket API) ---
++        "nsysnet.rpl:socket_lib_init" | "nsysnet.rpl:socket_lib_finish" => |_, _, c| {
++            c.r[3] = 0;
++        },
++        "nsysnet.rpl:set_resolver_allocator" => |_, _, c| {
++            c.r[3] = 0;
++        },
++        "nsysnet.rpl:socketlasterr" => |_, _, c| {
++            let err = NET.lock().unwrap().last_err as u32;
++            c.r[3] = err;
++        },
++        "nsysnet.rpl:htonl" | "nsysnet.rpl:ntohl" => |_, _, c| {
++            // PowerPC 32-bit registers are big-endian in host integer
++            c.r[3] = c.r[3];
++        },
++        "nsysnet.rpl:htons" | "nsysnet.rpl:ntohs" => |_, _, c| {
++            c.r[3] = c.r[3] & 0xffff;
++        },
++        "nsysnet.rpl:inet_ntoa" => |os, g, c| {
++            static INET_NTOA_PTR: AtomicU32 = AtomicU32::new(0);
++            let mut ptr = INET_NTOA_PTR.load(Ordering::SeqCst);
++            if ptr == 0 {
++                ptr = os.carve(g, 64);
++                INET_NTOA_PTR.store(ptr, Ordering::SeqCst);
++            }
++            // In PowerPC ABI, in_addr struct can be passed by pointer on stack if r3 >= 0x1000_0000
++            let ip_u32 = if c.r[3] >= 0x1000_0000 {
++                g.u32(c.r[3])
++            } else {
++                c.r[3]
++            };
++            let ip_str = format!(
++                "{}.{}.{}.{}\0",
++                (ip_u32 >> 24) & 0xff,
++                (ip_u32 >> 16) & 0xff,
++                (ip_u32 >> 8) & 0xff,
++                ip_u32 & 0xff
++            );
++            g.write(ptr, ip_str.as_bytes());
++            c.r[3] = ptr;
++        },
++        "nsysnet.rpl:inet_pton" => |_, g, c| {
++            let af = c.r[3];
++            let src_ptr = c.r[4];
++            let dst_ptr = c.r[5];
++            if af == 2 && src_ptr != 0 && dst_ptr != 0 {
++                let s = g.cstr(src_ptr);
++                if let Ok(ip) = s.parse::<Ipv4Addr>() {
++                    g.write(dst_ptr, &ip.octets());
++                    c.r[3] = 1;
++                } else {
++                    c.r[3] = 0;
++                }
++            } else {
++                c.r[3] = 0;
++            }
++        },
++        "nsysnet.rpl:gethostbyname" => |os, g, c| {
++            let name_ptr = c.r[3];
++            let name = if name_ptr != 0 { g.cstr(name_ptr) } else { "".into() };
++            let server_ip: Ipv4Addr = get_online_server()
++                .parse()
++                .unwrap_or(Ipv4Addr::new(127, 0, 0, 1));
++            eprintln!("[net] gethostbyname('{name}') -> resolving to {server_ip}");
++            let h = os.carve(g, 64);
++            g.put_u32(h, name_ptr); // h_name
++            g.put_u32(h + 4, h + 32); // h_aliases -> points to null pointer
++            g.put_u32(h + 8, 2); // h_addrtype = AF_INET (2)
++            g.put_u32(h + 12, 4); // h_length = 4
++            g.put_u32(h + 16, h + 20); // h_addr_list -> array of pointers
++            g.put_u32(h + 20, h + 28); // addr_list[0] -> pointer to IP
++            g.put_u32(h + 24, 0); // addr_list[1] -> NULL
++            g.write(h + 28, &server_ip.octets());
++            g.put_u32(h + 32, 0); // aliases[0] = NULL
++            c.r[3] = h;
++        },
++        "nsysnet.rpl:socket" => |_, _, c| {
++            let af = c.r[3] as i32;
++            let kind = c.r[4] as i32;
++            let proto = c.r[5] as i32;
++            // AF_INET = 2
++            if af == 2 {
++                let mut net = NET.lock().unwrap();
++                let fd = if kind == 2 {
++                    // SOCK_DGRAM (UDP)
++                    net.alloc_fd(HostSocket::UnboundUdp)
++                } else if kind == 1 {
++                    // SOCK_STREAM (TCP)
++                    net.alloc_fd(HostSocket::UnboundTcp)
++                } else {
++                    -1
++                };
++                eprintln!("[net] socket(af={af}, type={kind}, proto={proto}) -> fd={fd}");
++                c.r[3] = fd as u32;
++            } else {
++                c.r[3] = 0xffff_ffff;
++            }
++        },
++        "nsysnet.rpl:socketclose" => |_, _, c| {
++            let fd = c.r[3] as i32;
++            let mut net = NET.lock().unwrap();
++            eprintln!("[net] socketclose(fd={fd})");
++            c.r[3] = net.close(fd) as u32;
++        },
++        "nsysnet.rpl:bind" => |_, g, c| {
++            let fd = c.r[3] as i32;
++            let addr_ptr = c.r[4];
++            let sa = read_sockaddr(g, addr_ptr);
++            eprintln!("[net] bind(fd={fd}, sa={sa:?})");
++            let mut net = NET.lock().unwrap();
++            if let Some(sock_slot) = net.sockets.get_mut(&fd) {
++                if let Some(sa) = sa {
++                    let bind_addr = format!("0.0.0.0:{}", sa.port());
++                    let udp = UdpSocket::bind(&bind_addr)
++                        .or_else(|_| UdpSocket::bind("0.0.0.0:0"));
++                    if let Ok(u) = udp {
++                        configure_udp(&u);
++                        *sock_slot = HostSocket::Udp(u);
++                        net.last_err = 0;
++                        c.r[3] = 0;
++                        return;
++                    }
++                }
++            }
++            net.last_err = 0;
++            c.r[3] = 0;
++        },
++        "nsysnet.rpl:connect" => |_, g, c| {
++            let fd = c.r[3] as i32;
++            let addr_ptr = c.r[4];
++            let sa = read_sockaddr(g, addr_ptr);
++            let redir = sa.map(redirect_dest);
++            let mut net = NET.lock().unwrap();
++            if let (Some(dest), Some(r)) = (sa, redir) {
++                {
++                let m = net.nat_mappings.entry(fd).or_default();
++                if !m.iter().any(|&(_, rd)| rd == r) {
++                    m.push((dest, r));
++                }
++            }
++            }
++            if let Some(sock_slot) = net.sockets.get_mut(&fd) {
++                if let Some(redir) = redir {
++                    eprintln!("[net] connect(fd={fd}, dest={sa:?} -> redirected={redir:?})");
++                    match sock_slot {
++                        HostSocket::UnboundUdp => {
++                            if let Ok(u) = UdpSocket::bind("0.0.0.0:0") {
++                                configure_udp(&u);
++                                let _ = u.connect(SocketAddr::V4(redir));
++                                *sock_slot = HostSocket::Udp(u);
++                                net.last_err = 0;
++                                c.r[3] = 0;
++                                return;
++                            }
++                        }
++                        HostSocket::Udp(u) => {
++                            let _ = u.connect(SocketAddr::V4(redir));
++                            net.last_err = 0;
++                            c.r[3] = 0;
++                            return;
++                        }
++                        HostSocket::UnboundTcp => {
++                            if let Ok(t) = TcpStream::connect_timeout(&SocketAddr::V4(redir), std::time::Duration::from_millis(500))
++                                .or_else(|_| TcpStream::connect(SocketAddr::V4(redir)))
++                            {
++                                let _ = t.set_nonblocking(true);
++                                *sock_slot = HostSocket::Tcp(t);
++                                net.last_err = 0;
++                                c.r[3] = 0;
++                                return;
++                            } else {
++                                // Nonblocking connect handled gracefully
++                                net.last_err = 0;
++                                c.r[3] = 0;
++                                return;
++                            }
++                        }
++                        HostSocket::Tcp(_t) => {
++                            net.last_err = 0;
++                            c.r[3] = 0;
++                            return;
++                        }
++                    }
++                }
++            }
++            net.last_err = 0;
++            c.r[3] = 0;
++        },
++        "nsysnet.rpl:send" => |_, g, c| {
++            let fd = c.r[3] as i32;
++            let buf_ptr = c.r[4];
++            let len = c.r[5] as usize;
++            let mut net = NET.lock().unwrap();
++            if let Some(sock) = net.sockets.get_mut(&fd) {
++                let mut buf = vec![0u8; len];
++                g.read(buf_ptr, &mut buf);
++                match sock {
++                    HostSocket::Udp(u) => match u.send(&buf) {
++                        Ok(sent) => {
++                            net.last_err = 0;
++                            c.r[3] = sent as u32;
++                            return;
++                        }
++                        Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
++                            net.last_err = 6; // SO_EWOULDBLOCK
++                            c.r[3] = 0xffff_ffff;
++                            return;
++                        }
++                        Err(_) => {
++                            net.last_err = 0;
++                            c.r[3] = len as u32;
++                            return;
++                        }
++                    },
++                    HostSocket::Tcp(t) => match t.write(&buf) {
++                        Ok(sent) => {
++                            net.last_err = 0;
++                            c.r[3] = sent as u32;
++                            return;
++                        }
++                        Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
++                            net.last_err = 6; // SO_EWOULDBLOCK
++                            c.r[3] = 0xffff_ffff;
++                            return;
++                        }
++                        Err(_) => {
++                            net.last_err = 0;
++                            c.r[3] = len as u32;
++                            return;
++                        }
++                    },
++                    _ => {}
++                }
++            }
++            net.last_err = 0;
++            c.r[3] = len as u32;
++        },
++        "nsysnet.rpl:sendto" => |_, g, c| {
++            let fd = c.r[3] as i32;
++            let buf_ptr = c.r[4];
++            let len = c.r[5] as usize;
++            let dest_ptr = c.r[7];
++            let dest_sa = read_sockaddr(g, dest_ptr);
++            let redir = dest_sa.map(redirect_dest);
++            let mut net = NET.lock().unwrap();
++            if let (Some(dest), Some(r)) = (dest_sa, redir) {
++                {
++                let m = net.nat_mappings.entry(fd).or_default();
++                if !m.iter().any(|&(_, rd)| rd == r) {
++                    m.push((dest, r));
++                }
++            }
++            }
++            if let Some(sock) = net.sockets.get_mut(&fd) {
++                let mut buf = vec![0u8; len];
++                g.read(buf_ptr, &mut buf);
++                if let Some(redir) = redir {
++                    if net_trace(redir.port()) {
++                        eprintln!("[net] sendto(fd={fd}, len={len}, dest={dest_sa:?} -> {redir:?})");
++                    }
++                    match sock {
++                        HostSocket::UnboundUdp => {
++                            if let Ok(u) = UdpSocket::bind("0.0.0.0:0") {
++                                configure_udp(&u);
++                                let sent = send_logged(&u, &buf, redir, len);
++                                *sock = HostSocket::Udp(u);
++                                net.last_err = 0;
++                                c.r[3] = sent as u32;
++                                return;
++                            }
++                        }
++                        HostSocket::Udp(u) => {
++                            let sent = send_logged(u, &buf, redir, len);
++                            net.last_err = 0;
++                            c.r[3] = sent as u32;
++                            return;
++                        }
++                        _ => {}
++                    }
++                }
++            }
++            net.last_err = 0;
++            c.r[3] = len as u32;
++        },
++        "nsysnet.rpl:recv" => |_, g, c| {
++            let fd = c.r[3] as i32;
++            let buf_ptr = c.r[4];
++            let len = c.r[5] as usize;
++            let mut net = NET.lock().unwrap();
++            if let Some(sock) = net.sockets.get_mut(&fd) {
++                let mut buf = vec![0u8; len];
++                match sock {
++                    HostSocket::Udp(u) => loop {
++                        match u.recv_from(&mut buf) {
++                            Ok((n, from_addr)) => {
++                                eprintln!("[net] recv(fd={fd}) -> {n} bytes from {from_addr:?}");
++                                net.last_err = 0;
++                                g.write(buf_ptr, &buf[..n]);
++                                c.r[3] = n as u32;
++                                return;
++                            }
++                            Err(ref e) if e.raw_os_error() == Some(10054) => {
++                                continue;
++                            }
++                            Err(ref e) if e.raw_os_error() == Some(10040) => {
++                                eprintln!("[net] recv(fd={fd}) -> {len} bytes (UDP truncated WSAEMSGSIZE)");
++                                net.last_err = 0;
++                                g.write(buf_ptr, &buf[..len]);
++                                c.r[3] = len as u32;
++                                return;
++                            }
++                            Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
++                                net.last_err = 6; // SO_EWOULDBLOCK
++                                c.r[3] = 0xffff_ffff;
++                                return;
++                            }
++                            Err(e) => {
++                                eprintln!("[net] recv(fd={fd}) error: {e:?}");
++                                net.last_err = 6;
++                                c.r[3] = 0xffff_ffff;
++                                return;
++                            }
++                        }
++                    },
++                    HostSocket::Tcp(t) => match t.read(&mut buf) {
++                        Ok(n) => {
++                            eprintln!("[net] recv(fd={fd}) -> {n} bytes (TCP)");
++                            net.last_err = 0;
++                            g.write(buf_ptr, &buf[..n]);
++                            c.r[3] = n as u32;
++                            return;
++                        }
++                        Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
++                            net.last_err = 6; // SO_EWOULDBLOCK
++                            c.r[3] = 0xffff_ffff;
++                            return;
++                        }
++                        Err(e) => {
++                            eprintln!("[net] recv(fd={fd}) error (TCP): {e:?}");
++                            net.last_err = 6;
++                            c.r[3] = 0xffff_ffff;
++                            return;
++                        }
++                    },
++                    _ => {}
++                }
++            }
++            net.last_err = 6;
++            c.r[3] = 0xffff_ffff;
++        },
++        "nsysnet.rpl:recvfrom" => |_, g, c| {
++            let fd = c.r[3] as i32;
++            let buf_ptr = c.r[4];
++            let len = c.r[5] as usize;
++            let src_ptr = c.r[7];
++            let addrlen_ptr = c.r[8];
++            let mut net = NET.lock().unwrap();
++            if let Some(sock) = net.sockets.get_mut(&fd) {
++                let mut buf = vec![0u8; len];
++                if let HostSocket::Udp(u) = sock {
++                    loop {
++                        match u.recv_from(&mut buf) {
++                            Ok((n, from_addr)) => {
++                                if net_trace(from_addr.port()) {
++                                    eprintln!("[net] recvfrom(fd={fd}) -> {n} bytes from {from_addr:?}");
++                                }
++                                net.last_err = 0;
++                                g.write(buf_ptr, &buf[..n]);
++                                if let SocketAddr::V4(mut v4) = from_addr {
++                                    if let Some(m) = net.nat_mappings.get(&fd) {
++                                        if let Some(&(orig_dest, _)) = m.iter().find(|&&(_, rd)| rd == v4) {
++                                            v4 = orig_dest;
++                                        }
++                                    }
++                                    write_sockaddr(g, src_ptr, addrlen_ptr, v4);
++                                }
++                                c.r[3] = n as u32;
++                                return;
++                            }
++                            Err(ref e) if e.raw_os_error() == Some(10054) => {
++                                continue;
++                            }
++                            Err(ref e) if e.raw_os_error() == Some(10040) => {
++                                eprintln!("[net] recvfrom(fd={fd}) -> {len} bytes (WSAEMSGSIZE truncated)");
++                                net.last_err = 0;
++                                g.write(buf_ptr, &buf[..len]);
++                                c.r[3] = len as u32;
++                                return;
++                            }
++                            Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
++                                net.last_err = 6; // SO_EWOULDBLOCK
++                                c.r[3] = 0xffff_ffff;
++                                return;
++                            }
++                            Err(e) => {
++                                eprintln!("[net] recvfrom(fd={fd}) error: {e:?}");
++                                net.last_err = 6;
++                                c.r[3] = 0xffff_ffff;
++                                return;
++                            }
++                        }
++                    }
++                }
++            }
++            net.last_err = 6;
++            c.r[3] = 0xffff_ffff;
++        },
++        "nsysnet.rpl:select" => |_, g, c| {
++            // select(nfds, readfds, writefds, exceptfds, timeout)
++            let nfds = c.r[3] as usize;
++            let readfds = c.r[4];
++            let writefds = c.r[5];
++            let exceptfds = c.r[6];
++            let timeout_ptr = c.r[7];
++
++            let timeout = if timeout_ptr != 0 {
++                let sec = g.u32(timeout_ptr) as u64;
++                let usec = g.u32(timeout_ptr + 4) as u64;
++                Some(std::time::Duration::from_micros(sec * 1_000_000 + usec))
++            } else {
++                None // Block until ready (capped at 2s)
++            };
++
++            let start = std::time::Instant::now();
++            let max_wait = timeout.unwrap_or(std::time::Duration::from_secs(2));
++
++            let num_words = (nfds + 31) / 32;
++            let mut orig_read = Vec::with_capacity(num_words);
++            if readfds != 0 {
++                for i in 0..num_words {
++                    orig_read.push(g.u32(readfds + (i as u32) * 4));
++                }
++            }
++            let mut orig_write = Vec::with_capacity(num_words);
++            if writefds != 0 {
++                for i in 0..num_words {
++                    orig_write.push(g.u32(writefds + (i as u32) * 4));
++                }
++            }
++
++            loop {
++                let mut ready_count = 0u32;
++                let mut read_ready_count = 0u32;
++                let net = NET.lock().unwrap();
++
++                let mut ready_read = vec![0u32; num_words];
++                if readfds != 0 {
++                    for fd in 0..nfds as i32 {
++                        let word_idx = (fd / 32) as usize;
++                        let bit_idx = (fd % 32) as u32;
++                        let is_requested = (orig_read[word_idx] & (1 << bit_idx)) != 0
++                            || (orig_read[word_idx] & (1 << (31 - bit_idx))) != 0;
++                        if is_requested {
++                            let mut has_data = false;
++                            if let Some(sock) = net.sockets.get(&fd) {
++                                match sock {
++                                    HostSocket::Udp(u) => {
++                                        let mut peek_buf = [0u8; 2048];
++                                        loop {
++                                            match u.peek_from(&mut peek_buf) {
++                                                Ok((n, _)) => {
++                                                    has_data = n > 0;
++                                                    break;
++                                                }
++                                                Err(ref e) if e.raw_os_error() == Some(10040) => {
++                                                    // WSAEMSGSIZE: data is waiting in socket buffer!
++                                                    has_data = true;
++                                                    break;
++                                                }
++                                                Err(ref e) if e.raw_os_error() == Some(10054) => {
++                                                    let _ = u.recv_from(&mut peek_buf);
++                                                    continue;
++                                                }
++                                                _ => {
++                                                    has_data = false;
++                                                    break;
++                                                }
++                                            }
++                                        }
++                                    }
++                                    HostSocket::Tcp(t) => {
++                                        let mut peek_buf = [0u8; 1];
++                                        if let Ok(n) = t.peek(&mut peek_buf) {
++                                            has_data = n > 0;
++                                        }
++                                    }
++                                    _ => {}
++                                }
++                            }
++                            if has_data {
++                                ready_read[word_idx] |= (1 << bit_idx) | (1 << (31 - bit_idx));
++                                ready_count += 1;
++                                read_ready_count += 1;
++                            }
++                        }
++                    }
++                }
++
++                let mut ready_write = vec![0u32; num_words];
++                if writefds != 0 {
++                    for fd in 0..nfds as i32 {
++                        let word_idx = (fd / 32) as usize;
++                        let bit_idx = (fd % 32) as u32;
++                        let is_requested = (orig_write[word_idx] & (1 << bit_idx)) != 0
++                            || (orig_write[word_idx] & (1 << (31 - bit_idx))) != 0;
++                        if is_requested {
++                            if net.sockets.contains_key(&fd) {
++                                ready_write[word_idx] |= (1 << bit_idx) | (1 << (31 - bit_idx));
++                                ready_count += 1;
++                            }
++                        }
++                    }
++                }
++
++                let elapsed = start.elapsed();
++                let has_read_request = readfds != 0 && orig_read.iter().any(|&w| w != 0);
++                // If the guest is polling for read data, give up to a 2ms grace window for loopback packets
++                let min_grace = if has_read_request && read_ready_count == 0 {
++                    std::time::Duration::from_millis(2)
++                } else {
++                    std::time::Duration::ZERO
++                };
++                let wait_limit = max_wait.max(min_grace);
++                let should_return = if has_read_request {
++                    read_ready_count > 0 || elapsed >= wait_limit
++                } else {
++                    ready_count > 0 || elapsed >= wait_limit
++                };
++
++                if should_return {
++                    if readfds != 0 {
++                        for i in 0..num_words {
++                            g.put_u32(readfds + (i as u32) * 4, ready_read[i]);
++                        }
++                    }
++                    if writefds != 0 {
++                        for i in 0..num_words {
++                            g.put_u32(writefds + (i as u32) * 4, ready_write[i]);
++                        }
++                    }
++                    if exceptfds != 0 {
++                        for i in 0..num_words {
++                            g.put_u32(exceptfds + (i as u32) * 4, 0);
++                        }
++                    }
++
++                    if has_read_request || ready_count > 0 {
++                        eprintln!(
++                            "[net] select(nfds={nfds}, readfds={readfds:#x}, writefds={writefds:#x}, timeout={timeout:?}) -> ready={ready_count} (read_ready={read_ready_count}, elapsed={elapsed:?})"
++                        );
++                    }
++                    c.r[3] = ready_count;
++                    return;
++                }
++
++                drop(net);
++                std::thread::sleep(std::time::Duration::from_micros(500));
++            }
++        },
++        "nsysnet.rpl:setsockopt" => |_, _, c| {
++            let fd = c.r[3] as i32;
++            let level = c.r[4];
++            let optname = c.r[5];
++            eprintln!("[net] setsockopt(fd={fd}, level={level:#x}, optname={optname:#x}) -> 0");
++            c.r[3] = 0; // Success
++        },
++        "nsysnet.rpl:getsockname" => |_, g, c| {
++            let fd = c.r[3] as i32;
++            let addr_ptr = c.r[4];
++            let addrlen_ptr = c.r[5];
++            let net = NET.lock().unwrap();
++            let mut local_port = 0u16;
++            if let Some(sock) = net.sockets.get(&fd) {
++                match sock {
++                    HostSocket::Udp(u) => {
++                        if let Ok(addr) = u.local_addr() {
++                            local_port = addr.port();
++                        }
++                    }
++                    HostSocket::Tcp(t) => {
++                        if let Ok(addr) = t.local_addr() {
++                            local_port = addr.port();
++                        }
++                    }
++                    _ => {}
++                }
++            }
++            if local_port == 0 {
++                local_port = get_online_port();
++            }
++            let sa = SocketAddrV4::new(get_local_ip(), local_port);
++            eprintln!("[net] getsockname(fd={fd}) -> {sa:?}");
++            write_sockaddr(g, addr_ptr, addrlen_ptr, sa);
++            c.r[3] = 0;
++        },
++        "nsysnet.rpl:shutdown" => |_, _, c| {
++            let fd = c.r[3] as i32;
++            eprintln!("[net] shutdown(fd={fd})");
++            c.r[3] = 0;
++        },
++
++        s if s.starts_with("nsysnet.rpl:NSSL") => |_, _, c| c.r[3] = 0,
++        s if s.starts_with("nlibcurl.rpl:") => |_, _, c| c.r[3] = 0,
++
++        _ => return None,
++    })
++}
+diff --git a/crates/mh3u-rt/src/sync.rs b/crates/mh3u-rt/src/sync.rs
+index 8a32e2f..7928b46 100644
+--- a/crates/mh3u-rt/src/sync.rs
++++ b/crates/mh3u-rt/src/sync.rs
+@@ -215,6 +215,42 @@ pub fn find(name: &str) -> Option<KernelHandler> {
+             }
+             Step::Done
+         },
++        "coreinit:OSInitCond" => |k, c| {
++            k.conditions.insert(c.r[3], false);
++            k.guest.fill(c.r[3], 0, 0x24);
++            Step::Done
++        },
++        "coreinit:OSSignalCond" => |k, c| {
++            k.conditions.insert(c.r[3], true);
++            Step::Done
++        },
++        "coreinit:OSWaitCond" => |k, c| {
++            let cond_ptr = c.r[3];
++            let mutex_ptr = c.r[4];
++            let me = k.current;
++            let signaled = k.conditions.get(&cond_ptr).copied().unwrap_or(false);
++            if signaled {
++                let m = k.mutexes.entry(mutex_ptr).or_default();
++                if m.owner.is_none() || m.owner == Some(me) {
++                    m.owner = Some(me);
++                    m.count += 1;
++                    k.conditions.insert(cond_ptr, false);
++                    Step::Done
++                } else {
++                    Step::Wait
++                }
++            } else {
++                if let Some(m) = k.mutexes.get_mut(&mutex_ptr).filter(|m| m.owner == Some(me)) {
++                    if m.count > 0 {
++                        m.count -= 1;
++                        if m.count == 0 {
++                            m.owner = None;
++                        }
++                    }
++                }
++                Step::Wait
++            }
++        },
+         // the mode: 0 is manual reset, 1 resets when a thread passes
+         "coreinit:OSInitEvent" => |k, c| {
+             k.events.insert(c.r[3], (c.r[4] != 0, c.r[5] == 1));
+@@ -239,6 +275,37 @@ pub fn find(name: &str) -> Option<KernelHandler> {
+                 Step::Wait
+             }
+         },
++        "coreinit:OSWaitEventWithTimeout" => |k, c| {
++            let event_ptr = c.r[3];
++            let me = k.current;
++            let e = k.events.entry(event_ptr).or_default();
++            if e.0 {
++                if e.1 {
++                    e.0 = false;
++                }
++                k.threads[me].sleep_until = None;
++                done(c, TRUE)
++            } else {
++                let ticks = if c.r[4] != 0 || c.r[5] != 0 {
++                    (u64::from(c.r[4]) << 32) | u64::from(c.r[5])
++                } else {
++                    u64::from(c.r[6])
++                };
++                if ticks == 0 {
++                    done(c, FALSE)
++                } else {
++                    let until = *k.threads[me]
++                        .sleep_until
++                        .get_or_insert_with(|| Instant::now() + ticks_to_duration(ticks));
++                    if Instant::now() >= until {
++                        k.threads[me].sleep_until = None;
++                        done(c, FALSE)
++                    } else {
++                        Step::Wait
++                    }
++                }
++            }
++        },
+         "coreinit:OSInitSemaphore" => |k, c| {
+             k.semaphores.insert(c.r[3], c.r[4] as i32);
+             Step::Done

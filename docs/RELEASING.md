@@ -29,7 +29,7 @@ Crea un Release con el tag `v0.8.0` y sube **todo** el contenido de `dist-releas
 
 ## Obligaciones de licencia (AGPL-3.0)
 
-`mh3u-tools.exe` se compila a partir de `glinesbdev/mh3u-port` (AGPL-3.0) con modificaciones propias. Al distribuir el ejecutable hay que ofrecer su **código fuente correspondiente** (los cambios sobre el repositorio original, p. ej. como parches o un fork público) y enlazarlo en las notas del Release. `server.exe` es el de Matt-Wood-23 sin modificar: basta con enlazar su repositorio.
+`mh3u-tools.exe` se compila a partir de `glinesbdev/mh3u-port` (AGPL-3.0) con modificaciones propias. Al distribuir el ejecutable hay que ofrecer su **código fuente correspondiente** (ver `source-patches/`; regenera los parches si cambia el código de `mh3u-port`) y enlazarlo en las notas del Release. `server.exe` es el de Matt-Wood-23 sin modificar: basta con enlazar su repositorio.
 
 ## Seguridad
 

@@ -3,3 +3,4 @@
 *.py text eol=lf
 *.ico binary
 *.png binary
+*.patch -text
