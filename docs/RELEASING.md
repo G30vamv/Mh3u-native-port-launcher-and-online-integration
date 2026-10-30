@@ -23,7 +23,7 @@ El script:
 3. Crea el Release con el zip y el `manifest.json`, y deja solo el zip en los releases anteriores.
 
 - `server.exe` (mh3u-revival v0.2.0-beta, sin modificar) se incluye por defecto; `--no-server` lo omite. Si lo actualizas, cambia el tag en `package/SOURCE.txt` y `THIRD_PARTY.md`.
-- Nunca se publican: `SI_WiiU_MonsterHunter3Ultimate.jpg`, `launcher_config.json`, `game.dll`, logs.
+- Nunca se publican: `launcher_config.json`, `game.dll`, logs.
 - Si cambias algo ya publicado, mejor sube una versión nueva: los usuarios que ya la tienen no recibirían el cambio.
 
 ## 3. Publicado el Release
