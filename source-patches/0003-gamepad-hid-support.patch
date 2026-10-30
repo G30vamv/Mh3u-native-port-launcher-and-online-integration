@@ -1,0 +1,757 @@
+diff --git a/crates/mh3u-rt/Cargo.toml b/crates/mh3u-rt/Cargo.toml
+index 3ac8cfd..ac89167 100644
+--- a/crates/mh3u-rt/Cargo.toml
++++ b/crates/mh3u-rt/Cargo.toml
+@@ -23,4 +23,4 @@ memmap2 = "0.9"
+ 
+ # the guest's memory is reserved and committed on first touch (see src/memory.rs)
+ [target.'cfg(windows)'.dependencies]
+-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel", "Win32_System_Memory", "Win32_UI_Input_XboxController"] }
++windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel", "Win32_System_Memory", "Win32_UI_Input_XboxController", "Win32_Devices_HumanInterfaceDevice", "Win32_Devices_DeviceAndDriverInstallation", "Win32_Storage_FileSystem", "Win32_Security", "Win32_System_IO"] }
+diff --git a/crates/mh3u-rt/src/hidpad.rs b/crates/mh3u-rt/src/hidpad.rs
+new file mode 100644
+index 0000000..3dc2bb6
+--- /dev/null
++++ b/crates/mh3u-rt/src/hidpad.rs
+@@ -0,0 +1,672 @@
++//! Gamepads that gilrs's Windows backend (Windows.Gaming.Input) does not give the game: a DualSense or DualShock 4 (USB or
++//! Bluetooth) is not an Xbox-style `Gamepad` there, so its buttons arrive unmapped or not at all, and the XInput read used while the
++//! window is in the background only hears Xbox-style pads. These are read here straight from the HID device, on a thread each.
++//!
++//! Which devices: every Sony pad, and any other HID joystick/gamepad that is not an XInput device (its path has no `ig_`) and that
++//! gilrs does not already map. Everything else (Xbox pads, 2.4 GHz dongles, GameSir in XInput mode...) stays with gilrs, so nothing
++//! that worked changes. `MH3U_HID_PADS=0` turns this off. Costs one scan of the HID devices every 2 s and a blocked thread per pad.
++//!
++//! The reports are read with Windows's own HID parser (`HidP_*`) from the device's descriptor, so the transport and report mode
++//! do not matter; Sony's reports that the descriptor does not describe (DualSense 0x31, DualShock 4 0x11 over Bluetooth) are read
++//! by offset.
++
++use crate::input::{PadLayout, button, pad_button};
++use gilrs::Button;
++use std::sync::Mutex;
++
++pub const SONY: u16 = 0x054c;
++const DUALSHOCK4: [u16; 3] = [0x05c4, 0x09cc, 0x0ba0];
++const DUALSENSE: [u16; 2] = [0x0ce6, 0x0df2];
++
++/// Pads this module reads (vendor, product); gilrs's events from them are dropped so a pad is not heard twice.
++static OWNED: Mutex<Vec<(u16, u16)>> = Mutex::new(Vec::new());
++/// Pads gilrs has a mapping for, which this module leaves alone (unless Sony).
++static MAPPED: Mutex<Vec<(u16, u16)>> = Mutex::new(Vec::new());
++
++fn lock(m: &Mutex<Vec<(u16, u16)>>) -> std::sync::MutexGuard<'_, Vec<(u16, u16)>> {
++    m.lock().unwrap_or_else(|e| e.into_inner())
++}
++
++/// Whether a pad is read here, so gilrs's events from it are to be ignored.
++pub fn owns(vendor: u16, product: u16) -> bool {
++    lock(&OWNED).contains(&(vendor, product))
++}
++
++/// Tells that gilrs maps the pad, so it is left to gilrs.
++pub fn note_mapped(vendor: u16, product: u16) {
++    let mut m = lock(&MAPPED);
++    if !m.contains(&(vendor, product)) {
++        m.push((vendor, product));
++    }
++}
++
++/// What a report says: the four sticks (left x, left y, right x, right y; up and right are positive) and the GamePad buttons held.
++#[derive(Clone, Copy, Default, PartialEq, Debug)]
++pub struct State {
++    pub sticks: [f32; 4],
++    pub buttons: u32,
++}
++
++const STICK_DEADZONE: f32 = 0.18;
++const TRIGGER_THRESHOLD: f32 = 0.12;
++
++fn dead(v: f32) -> f32 {
++    if v.abs() < STICK_DEADZONE { 0.0 } else { v.clamp(-1.0, 1.0) }
++}
++
++/// A byte axis (0 to 255, 128 at rest) as -1 to 1.
++fn byte_axis(raw: u8) -> f32 {
++    (f32::from(raw) - 127.5) / 127.5
++}
++
++/// The d-pad buttons of a hat value (0 up, then clockwise by eighths; anything else is centred).
++pub fn hat_buttons(dir: u32) -> u32 {
++    match dir {
++        0 => button::UP,
++        1 => button::UP | button::RIGHT,
++        2 => button::RIGHT,
++        3 => button::DOWN | button::RIGHT,
++        4 => button::DOWN,
++        5 => button::DOWN | button::LEFT,
++        6 => button::LEFT,
++        7 => button::UP | button::LEFT,
++        _ => 0,
++    }
++}
++
++fn mask_of(buttons: &[Button], layout: PadLayout) -> u32 {
++    buttons.iter().filter_map(|b| pad_button(*b, layout)).fold(0, |a, m| a | m)
++}
++
++/// Sony's button bytes (the same in a DualShock 4 and a DualSense): b0 hat and face buttons, b1 shoulders and sticks, b2 PS.
++fn sony_buttons(b0: u8, b1: u8, b2: u8, l2: u8, r2: u8, layout: PadLayout) -> u32 {
++    let mut held = Vec::with_capacity(12);
++    let mut add = |on: bool, b: Button| {
++        if on {
++            held.push(b);
++        }
++    };
++    add(b0 & 0x10 != 0, Button::West); // square
++    add(b0 & 0x20 != 0, Button::South); // cross
++    add(b0 & 0x40 != 0, Button::East); // circle
++    add(b0 & 0x80 != 0, Button::North); // triangle
++    add(b1 & 0x01 != 0, Button::LeftTrigger);
++    add(b1 & 0x02 != 0, Button::RightTrigger);
++    add(b1 & 0x04 != 0 || f32::from(l2) / 255.0 > TRIGGER_THRESHOLD, Button::LeftTrigger2);
++    add(b1 & 0x08 != 0 || f32::from(r2) / 255.0 > TRIGGER_THRESHOLD, Button::RightTrigger2);
++    add(b1 & 0x10 != 0, Button::Select); // share / create
++    add(b1 & 0x20 != 0, Button::Start); // options
++    add(b1 & 0x40 != 0, Button::LeftThumb);
++    add(b1 & 0x80 != 0, Button::RightThumb);
++    add(b2 & 0x01 != 0, Button::Mode); // PS
++    mask_of(&held, layout) | hat_buttons(u32::from(b0 & 0x0f))
++}
++
++fn sony_state(sticks: [u8; 4], b: [u8; 3], l2: u8, r2: u8, layout: PadLayout) -> State {
++    State {
++        sticks: [
++            dead(byte_axis(sticks[0])),
++            dead(-byte_axis(sticks[1])),
++            dead(byte_axis(sticks[2])),
++            dead(-byte_axis(sticks[3])),
++        ],
++        buttons: sony_buttons(b[0], b[1], b[2], l2, r2, layout),
++    }
++}
++
++/// A Sony report read by offset, for the reports Windows's parser cannot read (they are not in the descriptor) and as a fallback.
++/// `bluetooth` tells the short report 0x01 of a Bluetooth pad (a DualShock 4's layout) from a DualSense's USB one.
++pub fn parse_sony_report(product: u16, bluetooth: bool, r: &[u8], layout: PadLayout) -> Option<State> {
++    let dualsense = DUALSENSE.contains(&product);
++    let dualshock = DUALSHOCK4.contains(&product);
++    match (*r.first()?, dualsense, dualshock) {
++        // DualSense, Bluetooth full report: id, tag, then x y rx ry l2 r2 counter b0 b1 b2
++        (0x31, true, _) if r.len() >= 12 => Some(sony_state([r[2], r[3], r[4], r[5]], [r[9], r[10], r[11]], r[6], r[7], layout)),
++        // DualSense, USB report: id, then x y rx ry l2 r2 counter b0 b1 b2
++        (0x01, true, _) if !bluetooth && r.len() >= 11 => {
++            Some(sony_state([r[1], r[2], r[3], r[4]], [r[8], r[9], r[10]], r[5], r[6], layout))
++        }
++        // DualShock 4 (and a DualSense's short Bluetooth report): id, x y rx ry b0 b1 b2 l2 r2
++        (0x01, _, true) | (0x01, true, _) if r.len() >= 10 => {
++            Some(sony_state([r[1], r[2], r[3], r[4]], [r[5], r[6], r[7]], r[8], r[9], layout))
++        }
++        // DualShock 4, Bluetooth full report: id, 2 bytes, then x y rx ry b0 b1 b2 l2 r2
++        (0x11, _, true) if r.len() >= 12 => Some(sony_state([r[3], r[4], r[5], r[6]], [r[7], r[8], r[9]], r[10], r[11], layout)),
++        _ => None,
++    }
++}
++
++#[cfg(windows)]
++pub use win::start;
++
++#[cfg(not(windows))]
++pub fn start(_layout: PadLayout) {}
++
++#[cfg(windows)]
++mod win {
++    use super::*;
++    use crate::input::INPUT;
++    use std::collections::HashSet;
++    use std::ffi::c_void;
++    use std::time::{Duration, Instant};
++    use windows_sys::Win32::Devices::DeviceAndDriverInstallation::*;
++    use windows_sys::Win32::Devices::HumanInterfaceDevice::*;
++    use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE};
++    use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile};
++
++    const RESCAN: Duration = Duration::from_secs(2);
++    /// A pad that sends nothing new still has its state applied this often (after the sources changed, a held button comes back).
++    const REFRESH: Duration = Duration::from_millis(250);
++    const PAGE_GENERIC: u16 = 0x01;
++    const PAGE_BUTTONS: u16 = 0x09;
++    const USAGE_HAT: u16 = 0x39;
++
++    static OPEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
++
++    pub fn start(layout: PadLayout) {
++        if std::env::var("MH3U_HID_PADS").is_ok_and(|v| v.trim() == "0") {
++            eprintln!("[hid] pads off (MH3U_HID_PADS=0)");
++            return;
++        }
++        let _ = std::thread::Builder::new().name("hid pads".into()).spawn(move || {
++            let mut rejected: HashSet<String> = HashSet::new();
++            let mut warned: HashSet<String> = HashSet::new();
++            let mut seen: HashSet<String> = HashSet::new();
++            loop {
++                let paths = device_paths();
++                rejected.retain(|p| paths.contains(p));
++                warned.retain(|p| paths.contains(p));
++                let paths_now = paths.clone();
++                for path in paths {
++                    if rejected.contains(&path) || OPEN.lock().unwrap_or_else(|e| e.into_inner()).contains(&path) {
++                        continue;
++                    }
++                    match Device::open(&path, seen.contains(&path), &mut warned) {
++                        Open::Pad(device) => {
++                            OPEN.lock().unwrap_or_else(|e| e.into_inner()).push(path.clone());
++                            let _ = std::thread::Builder::new().name("hid pad".into()).spawn(move || device.run(layout));
++                        }
++                        Open::Skip => {
++                            rejected.insert(path);
++                        }
++                        Open::Retry => {}
++                    }
++                }
++                seen = rejected.clone();
++                seen.extend(paths_now);
++                std::thread::sleep(RESCAN);
++            }
++        });
++    }
++
++    /// The paths of the HID devices present.
++    pub(super) fn device_paths() -> Vec<String> {
++        let mut paths = Vec::new();
++        // SAFETY: plain SetupAPI enumeration: every pointer given points at a live local, the detail buffer is sized by the length
++        // the first call asked for and aligned for the struct, and the device list is destroyed before returning.
++        unsafe {
++            let mut guid = std::mem::zeroed();
++            HidD_GetHidGuid(&mut guid);
++            let set = SetupDiGetClassDevsW(&guid, std::ptr::null(), std::ptr::null_mut(), DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
++            if set == -1 {
++                return paths;
++            }
++            let mut index = 0;
++            loop {
++                let mut interface: SP_DEVICE_INTERFACE_DATA = std::mem::zeroed();
++                interface.cbSize = std::mem::size_of::<SP_DEVICE_INTERFACE_DATA>() as u32;
++                if SetupDiEnumDeviceInterfaces(set, std::ptr::null(), &guid, index, &mut interface) == 0 {
++                    break;
++                }
++                index += 1;
++                let mut needed = 0u32;
++                SetupDiGetDeviceInterfaceDetailW(set, &interface, std::ptr::null_mut(), 0, &mut needed, std::ptr::null_mut());
++                if needed == 0 {
++                    continue;
++                }
++                let mut buffer = vec![0u64; (needed as usize).div_ceil(8)];
++                let detail = buffer.as_mut_ptr() as *mut SP_DEVICE_INTERFACE_DETAIL_DATA_W;
++                (*detail).cbSize = std::mem::size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() as u32;
++                if SetupDiGetDeviceInterfaceDetailW(set, &interface, detail, needed, std::ptr::null_mut(), std::ptr::null_mut()) == 0 {
++                    continue;
++                }
++                let start = std::ptr::addr_of!((*detail).DevicePath) as *const u16;
++                let mut len = 0;
++                while *start.add(len) != 0 {
++                    len += 1;
++                }
++                paths.push(String::from_utf16_lossy(std::slice::from_raw_parts(start, len)));
++            }
++            SetupDiDestroyDeviceInfoList(set);
++        }
++        paths
++    }
++
++    pub(super) enum Open {
++        Pad(Device),
++        /// Not a pad for this module (never looked at again while it stays connected).
++        Skip,
++        /// A pad it could not open now (another program has it); tried again at the next scan.
++        Retry,
++    }
++
++    /// One axis of the descriptor: its report, usage and range.
++    struct Axis {
++        report: u8,
++        usage: u16,
++        min: i32,
++        max: i32,
++        bits: u16,
++    }
++
++    pub(super) struct Device {
++        handle: usize,
++        preparsed: isize,
++        path: String,
++        pub(super) vendor: u16,
++        pub(super) product: u16,
++        bluetooth: bool,
++        report_len: usize,
++        axes: Vec<Axis>,
++    }
++
++    impl Device {
++        pub(super) fn open(path: &str, settled: bool, warned: &mut HashSet<String>) -> Open {
++            let lower = path.to_ascii_lowercase();
++            // XInput devices (Xbox pads and everything that pretends to be one) are gilrs's
++            if lower.contains("&ig_") || lower.contains("\\ig_") {
++                return Open::Skip;
++            }
++            let sony_path = lower.contains("054c");
++            let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
++            // SAFETY: `wide` is NUL-terminated and outlives the call
++            let handle = unsafe {
++                CreateFileW(
++                    wide.as_ptr(),
++                    GENERIC_READ,
++                    FILE_SHARE_READ | FILE_SHARE_WRITE,
++                    std::ptr::null(),
++                    OPEN_EXISTING,
++                    0,
++                    std::ptr::null_mut(),
++                )
++            };
++            if handle == INVALID_HANDLE_VALUE {
++                if sony_path && warned.insert(path.to_string()) {
++                    eprintln!("[hid] a Sony pad could not be opened (another program, such as DS4Windows or Steam, has it): {path}");
++                }
++                return if sony_path { Open::Retry } else { Open::Skip };
++            }
++            // SAFETY: `handle` is a valid open HID device; the structs are plain data the calls fill in, the preparsed data is freed
++            // here when the device is not used and otherwise by `run` when it ends
++            unsafe {
++                let mut attributes: HIDD_ATTRIBUTES = std::mem::zeroed();
++                attributes.Size = std::mem::size_of::<HIDD_ATTRIBUTES>() as u32;
++                let mut preparsed = 0isize;
++                if !HidD_GetAttributes(handle, &mut attributes) || !HidD_GetPreparsedData(handle, &mut preparsed) {
++                    CloseHandle(handle);
++                    return Open::Skip;
++                }
++                let mut caps: HIDP_CAPS = std::mem::zeroed();
++                let joystick = HidP_GetCaps(preparsed, &mut caps) == HIDP_STATUS_SUCCESS
++                    && caps.UsagePage == PAGE_GENERIC
++                    && (caps.Usage == 0x04 || caps.Usage == 0x05);
++                let (vendor, product) = (attributes.VendorID, attributes.ProductID);
++                let sony = vendor == SONY;
++                let mapped = lock(&MAPPED).contains(&(vendor, product));
++                // a pad that is not Sony's waits one scan, so gilrs has told about it (and its mapping) first
++                if !joystick || caps.InputReportByteLength < 2 || (!sony && mapped) {
++                    HidD_FreePreparsedData(preparsed);
++                    CloseHandle(handle);
++                    return Open::Skip;
++                }
++                if !sony && !settled {
++                    HidD_FreePreparsedData(preparsed);
++                    CloseHandle(handle);
++                    return Open::Retry;
++                }
++                let mut axes = Vec::new();
++                let mut count = caps.NumberInputValueCaps;
++                let mut value_caps = vec![HIDP_VALUE_CAPS::default(); usize::from(count)];
++                if count > 0 && HidP_GetValueCaps(HidP_Input, value_caps.as_mut_ptr(), &mut count, preparsed) == HIDP_STATUS_SUCCESS {
++                    for c in &value_caps[..usize::from(count)] {
++                        if c.UsagePage != PAGE_GENERIC {
++                            continue;
++                        }
++                        let usages = if c.IsRange {
++                            c.Anonymous.Range.UsageMin..=c.Anonymous.Range.UsageMax
++                        } else {
++                            c.Anonymous.NotRange.Usage..=c.Anonymous.NotRange.Usage
++                        };
++                        for usage in usages {
++                            axes.push(Axis {
++                                report: c.ReportID,
++                                usage,
++                                min: c.LogicalMin,
++                                max: c.LogicalMax,
++                                bits: c.BitSize,
++                            });
++                        }
++                    }
++                }
++                let bluetooth = lower.contains("00001124-0000-1000-8000-00805f9b34fb");
++                let mut name = [0u16; 128];
++                let name = if HidD_GetProductString(handle, name.as_mut_ptr() as *mut c_void, (name.len() * 2) as u32) {
++                    String::from_utf16_lossy(&name).trim_end_matches('\0').to_string()
++                } else {
++                    String::from("HID gamepad")
++                };
++                eprintln!(
++                    "[hid] gamepad read from the device: {name} ({vendor:04x}:{product:04x}, {})",
++                    if bluetooth { "Bluetooth" } else { "USB" }
++                );
++                lock(&OWNED).push((vendor, product));
++                Open::Pad(Device {
++                    handle: handle as usize,
++                    preparsed,
++                    path: path.to_string(),
++                    vendor,
++                    product,
++                    bluetooth,
++                    report_len: usize::from(caps.InputReportByteLength),
++                    axes,
++                })
++            }
++        }
++
++        /// The value of an axis in a report, 0 to 1 (a missing axis is `None`).
++        fn axis(&self, report: &mut [u8], usage: u16) -> Option<f32> {
++            let a = self.axes.iter().find(|a| a.usage == usage && a.report == report[0])?;
++            let mut raw = 0u32;
++            // SAFETY: `report` holds a whole input report (`report_len` bytes) and the preparsed data belongs to this device
++            let status = unsafe {
++                HidP_GetUsageValue(
++                    HidP_Input,
++                    PAGE_GENERIC,
++                    0,
++                    usage,
++                    &mut raw,
++                    self.preparsed,
++                    report.as_ptr(),
++                    report.len() as u32,
++                )
++            };
++            if status != HIDP_STATUS_SUCCESS || a.max <= a.min {
++                return None;
++            }
++            let value = if a.min < 0 && a.bits < 32 {
++                let shift = 32 - u32::from(a.bits);
++                ((raw << shift) as i32) >> shift
++            } else {
++                raw as i32
++            };
++            Some(((value - a.min) as f32 / (a.max - a.min) as f32).clamp(0.0, 1.0))
++        }
++
++        /// Reads a report with Windows's HID parser; `None` when the descriptor does not describe it.
++        fn parse(&self, report: &mut [u8], layout: PadLayout) -> Option<State> {
++            let sony = self.vendor == SONY;
++            let lx = self.axis(report, 0x30)?;
++            let ly = self.axis(report, 0x31)?;
++            let z = self.axis(report, 0x32);
++            let rz = self.axis(report, 0x35);
++            let rx = self.axis(report, 0x33);
++            let ry = self.axis(report, 0x34);
++            // Sony: right stick Z/Rz, triggers Rx/Ry. Others: right stick Z/Rz, or Rx/Ry when there is no Z/Rz
++            let (right_x, right_y) = if sony || z.is_some() { (z, rz) } else { (rx, ry) };
++            let stick = |v: f32| dead(v * 2.0 - 1.0);
++            let mut state = State {
++                sticks: [stick(lx), -stick(ly), right_x.map_or(0.0, stick), -right_y.map_or(0.0, stick)],
++                buttons: 0,
++            };
++            if sony {
++                if rx.is_some_and(|v| v > TRIGGER_THRESHOLD) {
++                    state.buttons |= button::ZL;
++                }
++                if ry.is_some_and(|v| v > TRIGGER_THRESHOLD) {
++                    state.buttons |= button::ZR;
++                }
++            }
++            if let Some(hat) = self.hat(report) {
++                state.buttons |= hat;
++            }
++            let mut usages = [0u16; 32];
++            let mut count = usages.len() as u32;
++            // SAFETY: as in `axis`; `usages` has room for `count` entries
++            let status = unsafe {
++                HidP_GetUsages(
++                    HidP_Input,
++                    PAGE_BUTTONS,
++                    0,
++                    usages.as_mut_ptr(),
++                    &mut count,
++                    self.preparsed,
++                    report.as_mut_ptr(),
++                    report.len() as u32,
++                )
++            };
++            if status == HIDP_STATUS_SUCCESS {
++                for &u in &usages[..count as usize] {
++                    if let Some(b) = if sony { sony_usage(u) } else { generic_usage(u) } {
++                        state.buttons |= pad_button(b, layout).unwrap_or(0);
++                    }
++                }
++            }
++            Some(state)
++        }
++
++        fn hat(&self, report: &mut [u8]) -> Option<u32> {
++            let a = self.axes.iter().find(|a| a.usage == USAGE_HAT && a.report == report[0])?;
++            let mut raw = 0u32;
++            // SAFETY: as in `axis`
++            let status = unsafe {
++                HidP_GetUsageValue(
++                    HidP_Input,
++                    PAGE_GENERIC,
++                    0,
++                    USAGE_HAT,
++                    &mut raw,
++                    self.preparsed,
++                    report.as_ptr(),
++                    report.len() as u32,
++                )
++            };
++            if status != HIDP_STATUS_SUCCESS {
++                return None;
++            }
++            let dir = i64::from(raw) - i64::from(a.min);
++            Some(if dir < 0 { 0 } else { hat_buttons(dir as u32) })
++        }
++
++        fn run(self, layout: PadLayout) {
++            let mut buffer = vec![0u8; self.report_len];
++            let mut last = State::default();
++            let mut applied = Instant::now();
++            let mut first = true;
++            loop {
++                let mut read = 0u32;
++                // SAFETY: `buffer` has `report_len` bytes and the handle is this device's, open until the end of this function
++                let ok = unsafe {
++                    ReadFile(
++                        self.handle as HANDLE,
++                        buffer.as_mut_ptr(),
++                        buffer.len() as u32,
++                        &mut read,
++                        std::ptr::null_mut(),
++                    )
++                };
++                if ok == 0 || read == 0 {
++                    break;
++                }
++                let n = (read as usize).min(buffer.len());
++                let state = self.parse(&mut buffer, layout).or_else(|| {
++                    if self.vendor == SONY {
++                        parse_sony_report(self.product, self.bluetooth, &buffer[..n], layout)
++                    } else {
++                        None
++                    }
++                });
++                let Some(state) = state else { continue };
++                if first {
++                    eprintln!(
++                        "[hid] first report from {:04x}:{:04x}: id 0x{:02x}, {n} bytes",
++                        self.vendor, self.product, buffer[0]
++                    );
++                    first = false;
++                }
++                if state != last || applied.elapsed() >= REFRESH {
++                    apply(state, last);
++                    last = state;
++                    applied = Instant::now();
++                }
++            }
++            eprintln!("[hid] gamepad {:04x}:{:04x} disconnected", self.vendor, self.product);
++            // SAFETY: the handle and the preparsed data are this device's and are not used again
++            unsafe {
++                CloseHandle(self.handle as HANDLE);
++                HidD_FreePreparsedData(self.preparsed);
++            }
++            {
++                let mut owned = lock(&OWNED);
++                if let Some(i) = owned.iter().position(|p| *p == (self.vendor, self.product)) {
++                    owned.remove(i);
++                }
++            }
++            OPEN.lock().unwrap_or_else(|e| e.into_inner()).retain(|p| *p != self.path);
++            INPUT.release_pads();
++        }
++    }
++
++    /// Sends the state to the game: the buttons whose state differs from `before`, or every held one when it is a refresh.
++    fn apply(state: State, before: State) {
++        for bit in 0..32 {
++            let m = 1u32 << bit;
++            let (now, was) = (state.buttons & m != 0, before.buttons & m != 0);
++            if now != was || now {
++                INPUT.set_pad_button(m, now);
++            }
++        }
++        for (i, v) in state.sticks.into_iter().enumerate() {
++            INPUT.set_pad_axis(i, v);
++        }
++    }
++
++    /// Sony's button usages (page 9) in the order of their descriptors.
++    fn sony_usage(u: u16) -> Option<Button> {
++        Some(match u {
++            1 => Button::West,
++            2 => Button::South,
++            3 => Button::East,
++            4 => Button::North,
++            5 => Button::LeftTrigger,
++            6 => Button::RightTrigger,
++            7 => Button::LeftTrigger2,
++            8 => Button::RightTrigger2,
++            9 => Button::Select,
++            10 => Button::Start,
++            11 => Button::LeftThumb,
++            12 => Button::RightThumb,
++            13 => Button::Mode,
++            _ => return None,
++        })
++    }
++
++    /// The usual order of a generic pad's buttons (A B X Y, bumpers, back, start, sticks).
++    fn generic_usage(u: u16) -> Option<Button> {
++        Some(match u {
++            1 => Button::South,
++            2 => Button::East,
++            3 => Button::West,
++            4 => Button::North,
++            5 => Button::LeftTrigger,
++            6 => Button::RightTrigger,
++            7 => Button::Select,
++            8 => Button::Start,
++            9 => Button::LeftThumb,
++            10 => Button::RightThumb,
++            _ => return None,
++        })
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const L: PadLayout = PadLayout::Xbox;
++
++    /// Runs the real enumeration and opening on whatever HID devices this machine has (keyboards, mice, maybe pads): it must not
++    /// crash or claim a device that is not a pad.
++    #[cfg(windows)]
++    #[test]
++    fn scanning_this_machine_works() {
++        let paths = win::device_paths();
++        eprintln!("{} HID devices", paths.len());
++        let mut warned = std::collections::HashSet::new();
++        for p in &paths {
++            if let win::Open::Pad(d) = win::Device::open(p, true, &mut warned) {
++                eprintln!("pad: {p} {:04x}:{:04x}", d.vendor, d.product);
++            }
++        }
++    }
++
++    #[test]
++    fn hat_directions() {
++        assert_eq!(hat_buttons(0), button::UP);
++        assert_eq!(hat_buttons(3), button::DOWN | button::RIGHT);
++        assert_eq!(hat_buttons(8), 0);
++        assert_eq!(hat_buttons(15), 0);
++    }
++
++    #[test]
++    fn dualsense_bluetooth_full_report() {
++        // id 0x31, tag, x y rx ry l2 r2 counter, b0 b1 b2: cross + R1 + right stick pushed up and left stick right
++        let mut r = [0u8; 78];
++        r[0] = 0x31;
++        r[2..8].copy_from_slice(&[255, 128, 128, 0, 0, 0]);
++        r[9] = 0x20 | 0x08; // cross, hat neutral
++        r[10] = 0x02;
++        let s = parse_sony_report(0x0ce6, true, &r, L).unwrap();
++        assert!(s.sticks[0] > 0.9 && s.sticks[1] == 0.0 && s.sticks[3] > 0.9);
++        assert_eq!(s.buttons, button::B | button::R, "cross is the GamePad's B with the xbox layout");
++    }
++
++    #[test]
++    fn dualshock_usb_and_short_bluetooth_reports_share_a_layout() {
++        let mut r = [0u8; 64];
++        r[0] = 0x01;
++        r[1..5].copy_from_slice(&[128, 128, 128, 128]);
++        r[5] = 0x40 | 0x02; // circle, hat right
++        r[8] = 255; // L2
++        let s = parse_sony_report(0x09cc, false, &r, L).unwrap();
++        assert_eq!(s.buttons, button::A | button::RIGHT | button::ZL);
++        let bt = parse_sony_report(0x0ce6, true, &r[..10], L).unwrap();
++        assert_eq!(bt, s, "a DualSense's short Bluetooth report is read like a DualShock 4's");
++    }
++
++    #[test]
++    fn dualsense_usb_report() {
++        let mut r = [0u8; 64];
++        r[0] = 0x01;
++        r[1..5].copy_from_slice(&[128, 0, 128, 128]);
++        r[5] = 200; // L2
++        r[8] = 0x08 | 0x80; // neutral hat, triangle
++        r[10] = 0x01; // PS
++        let s = parse_sony_report(0x0ce6, false, &r, L).unwrap();
++        assert!(s.sticks[1] > 0.9, "the stick pushed up reads positive");
++        assert_eq!(s.buttons, button::X | button::HOME | button::ZL);
++    }
++
++    #[test]
++    fn unknown_or_short_reports_are_ignored() {
++        assert_eq!(parse_sony_report(0x0ce6, true, &[], L), None);
++        assert_eq!(parse_sony_report(0x0ce6, true, &[0x31, 0, 1, 2], L), None);
++        assert_eq!(parse_sony_report(0x1234, false, &[0x01; 64], L), None);
++    }
++
++    #[test]
++    fn sticks_at_rest_stay_at_zero() {
++        let s = sony_state([128, 127, 128, 127], [8, 0, 0], 0, 0, L);
++        assert_eq!(s, State::default());
++    }
++}
+diff --git a/crates/mh3u-rt/src/input.rs b/crates/mh3u-rt/src/input.rs
+index 3a48327..7b577ee 100644
+--- a/crates/mh3u-rt/src/input.rs
++++ b/crates/mh3u-rt/src/input.rs
+@@ -389,6 +389,15 @@ fn face_name(mask: u32) -> &'static str {
+     }
+ }
+ 
++/// Tells the HID reader which pads gilrs has a mapping for (it leaves those to gilrs).
++fn note_mapped(pad: &gilrs::Gamepad<'_>) {
++    if let (Some(v), Some(p)) = (pad.vendor_id(), pad.product_id())
++        && pad.mapping_source() != gilrs::MappingSource::None
++    {
++        crate::hidpad::note_mapped(v, p);
++    }
++}
++
+ pub fn start_gamepads() {
+     if std::env::var("MH3U_GAMEPADS").is_ok_and(|v| v.trim() == "0") {
+         eprintln!("gamepads off (MH3U_GAMEPADS=0)");
+@@ -424,7 +433,10 @@ pub fn start_gamepads() {
+         let mut told = [false; 4];
+         for (_, pad) in gilrs.gamepads() {
+             eprintln!("gamepad: {}", pad.name());
++            note_mapped(&pad);
+         }
++        // DualSense, DualShock 4 and other HID pads gilrs cannot map are read from the device itself
++        crate::hidpad::start(layout);
+         use gilrs::{Axis, EventType};
+         let trace = std::env::var_os("MH3U_TRACE_PAD").is_some();
+         // The pending events are taken without waiting, and the thread sleeps a little when there are none. It does not wait in
+@@ -448,6 +460,13 @@ pub fn start_gamepads() {
+             if trace {
+                 eprintln!("[gamepad] {:?}", event.event);
+             }
++            let pad = gilrs.gamepad(event.id);
++            if let (Some(v), Some(p)) = (pad.vendor_id(), pad.product_id())
++                && crate::hidpad::owns(v, p)
++            {
++                // a pad read from its HID device: gilrs's (unmapped) view of it is not heard twice
++                continue;
++            }
+             match event.event {
+                 EventType::ButtonPressed(b, _) | EventType::ButtonReleased(b, _) => {
+                     let down = matches!(event.event, EventType::ButtonPressed(..));
+@@ -462,7 +481,10 @@ pub fn start_gamepads() {
+                     }
+                     INPUT.set_pad_button(mask, down);
+                 }
+-                EventType::Connected => eprintln!("gamepad connected: {}", gilrs.gamepad(event.id).name()),
++                EventType::Connected => {
++                    note_mapped(&gilrs.gamepad(event.id));
++                    eprintln!("gamepad connected: {}", gilrs.gamepad(event.id).name())
++                }
+                 EventType::AxisChanged(a, v, _) => {
+                     let axis = match a {
+                         Axis::LeftStickX => 0,
+diff --git a/crates/mh3u-rt/src/lib.rs b/crates/mh3u-rt/src/lib.rs
+index c43b073..74fe57a 100644
+--- a/crates/mh3u-rt/src/lib.rs
++++ b/crates/mh3u-rt/src/lib.rs
+@@ -10,6 +10,7 @@ mod fs;
+ mod game;
+ mod guest;
+ mod gx2;
++mod hidpad;
+ pub mod hooks;
+ 
+ /// A zeroed context with no guest memory, for tests of hook callbacks elsewhere.

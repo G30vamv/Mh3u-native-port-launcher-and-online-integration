@@ -56,7 +56,7 @@ _TH["CTkComboBox"].update({"button_color": ["#3b6073", "#3b6073"], "button_hover
 _TH["CTkEntry"].update({"fg_color": ["#fff6e0", "#0d1820"], "border_color": ["#b9a97f", "#2b4a58"]})
 _TH["CTkScrollbar"].update({"button_color": ["#3b6073", "#3b6073"], "button_hover_color": ["#c98f2b", "#c98f2b"]})
 
-APP_VERSION = "v0.8.5"
+APP_VERSION = "v0.8.6"
 
 # Header update widget colors (state -> label color) and button looks: (fg, hover)
 UPDATE_COLORS = {"info": "#9db3ba", "ok": "#7fcfa6", "warn": "#eab84c", "error": "#e07a6f"}

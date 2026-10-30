@@ -9,7 +9,7 @@ Este paquete se distribuye bajo la GNU Affero General Public License v3.0
 
 2) mh3u-tools.exe  (port nativo de glinesbdev/mh3u-port, con modificaciones)
    Original : https://github.com/glinesbdev/mh3u-port  (commit base 41d3a9b)
-   Cambios  : carpeta source-patches/ del repositorio (1), parches 0001 y 0002,
+   Cambios  : carpeta source-patches/ del repositorio (1), parches 0001, 0002 y 0003,
               con instrucciones para reproducir el binario.
 
 3) server.exe  (mh3u-revival de Matt-Wood-23, SIN modificar, version v0.2.0-beta)
