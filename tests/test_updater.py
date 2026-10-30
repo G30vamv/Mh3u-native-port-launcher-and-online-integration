@@ -47,6 +47,11 @@ class UpdaterTests(unittest.TestCase):
             with self.assertRaises(updater.UpdateError, msg=bad):
                 updater._safe_rel(bad)
 
+    def test_image_assets_are_allowed(self):
+        # a manifest entry with a type the updater refuses blocks the update for everyone (v0.8.8 shipped banner.jpg)
+        for rel in ("assets/banner.png", "assets/banner.jpg", "MH3U.exe", "mods/hooks.txt"):
+            self.assertTrue(updater._safe_rel(rel))
+
     def test_only_changed_files_are_downloaded(self):
         self._write(self.base, "LEEME.txt", b"same")
         self._write(self.rel, "LEEME.txt", b"same")

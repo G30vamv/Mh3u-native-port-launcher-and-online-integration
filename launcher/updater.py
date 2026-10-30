@@ -31,7 +31,7 @@ PROTECTED = {
     "mh3u_latest.log",
 }
 PROTECTED_DIRS = {"toolchain", UPDATE_DIR, BACKUP_DIR, "mh3u_dump"}
-ALLOWED_EXT = {".exe", ".dll", ".py", ".bat", ".txt", ".png", ".ico", ".json", ".md"}
+ALLOWED_EXT = {".exe", ".dll", ".py", ".bat", ".txt", ".png", ".jpg", ".ico", ".json", ".md"}
 
 
 # cmd.exe system tools by full path (a user PATH may shadow find/timeout with other tools).
