@@ -1,5 +1,5 @@
 ﻿============================================================
-  MONSTER HUNTER 3 ULTIMATE - PORT NATIVO DE PC (v0.8.6)
+  MONSTER HUNTER 3 ULTIMATE - PORT NATIVO DE PC (v0.8.7)
   Launcher desarrollado por: g30wolff99
 ============================================================
 
@@ -10,7 +10,7 @@ Este paquete es 100% PORTABLE y AUTÓNOMO (funciona directamente al descomprimir
 - Soporte de escalado AMD FidelityFX FSR 1.0 y AMD CAS integrado en Vulkan/DirectX 12.
 - Soporte para optimización inter-archivos ThinLTO (-flto=thin + -O3).
 - Motor nativo 'mh3u-tools.exe' optimizado con contador de FPS e interfaz fluida.
-- Launcher gráfico oficial v0.8.6 con registro en tiempo real escroleable.
+- Launcher gráfico oficial v0.8.7 con registro en tiempo real escroleable.
 
 ------------------------------------------------------------
 PASOS RÁPIDOS PARA JUGAR (SOLO LA PRIMERA VEZ):
@@ -51,3 +51,6 @@ CONSEJO IMPORTANTE:
   DualSense (PS5) y DualShock 4 (PS4) por cable o Bluetooth, y la mayoría de mandos HID
   genéricos. No hace falta Steam ni DS4Windows. Si tu mando no responde, ciérralos (o
   desactiva la emulación) y reinicia el juego.
+  Si usas HidHide (DSX, DS4Windows) y el mando está oculto, el launcher te ofrece permitir
+  a MH3U leerlo al pulsar JUGAR (pide permisos de administrador); con DSX o DS4Windows
+  abiertos no hace falta.

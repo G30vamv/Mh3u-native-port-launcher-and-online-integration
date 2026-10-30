@@ -10,10 +10,10 @@ index 3ac8cfd..ac89167 100644
 +windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel", "Win32_System_Memory", "Win32_UI_Input_XboxController", "Win32_Devices_HumanInterfaceDevice", "Win32_Devices_DeviceAndDriverInstallation", "Win32_Storage_FileSystem", "Win32_Security", "Win32_System_IO"] }
 diff --git a/crates/mh3u-rt/src/hidpad.rs b/crates/mh3u-rt/src/hidpad.rs
 new file mode 100644
-index 0000000..3dc2bb6
+index 0000000..6587625
 --- /dev/null
 +++ b/crates/mh3u-rt/src/hidpad.rs
-@@ -0,0 +1,672 @@
+@@ -0,0 +1,721 @@
 +//! Gamepads that gilrs's Windows backend (Windows.Gaming.Input) does not give the game: a DualSense or DualShock 4 (USB or
 +//! Bluetooth) is not an Xbox-style `Gamepad` there, so its buttons arrive unmapped or not at all, and the XInput read used while the
 +//! window is in the background only hears Xbox-style pads. These are read here straight from the HID device, on a thread each.
@@ -21,6 +21,9 @@ index 0000000..3dc2bb6
 +//! Which devices: every Sony pad, and any other HID joystick/gamepad that is not an XInput device (its path has no `ig_`) and that
 +//! gilrs does not already map. Everything else (Xbox pads, 2.4 GHz dongles, GameSir in XInput mode...) stays with gilrs, so nothing
 +//! that worked changes. `MH3U_HID_PADS=0` turns this off. Costs one scan of the HID devices every 2 s and a blocked thread per pad.
++//!
++//! While an XInput pad is connected (a real Xbox pad, or the virtual one DSX, DS4Windows or Steam Input make) the pads here are
++//! left alone: that pad already reaches the game through gilrs, and reading the physical one too would send everything twice.
 +//!
 +//! The reports are read with Windows's own HID parser (`HidP_*`) from the device's descriptor, so the transport and report mode
 +//! do not matter; Sony's reports that the descriptor does not describe (DualSense 0x31, DualShock 4 0x11 over Bluetooth) are read
@@ -164,11 +167,13 @@ index 0000000..3dc2bb6
 +    use crate::input::INPUT;
 +    use std::collections::HashSet;
 +    use std::ffi::c_void;
++    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 +    use std::time::{Duration, Instant};
 +    use windows_sys::Win32::Devices::DeviceAndDriverInstallation::*;
 +    use windows_sys::Win32::Devices::HumanInterfaceDevice::*;
 +    use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE};
 +    use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile};
++    use windows_sys::Win32::UI::Input::XboxController::{XINPUT_STATE, XInputGetState};
 +
 +    const RESCAN: Duration = Duration::from_secs(2);
 +    /// A pad that sends nothing new still has its state applied this often (after the sources changed, a held button comes back).
@@ -176,6 +181,17 @@ index 0000000..3dc2bb6
 +    const PAGE_GENERIC: u16 = 0x01;
 +    const PAGE_BUTTONS: u16 = 0x09;
 +    const USAGE_HAT: u16 = 0x39;
++
++    /// Whether an XInput pad is connected (looked at every scan).
++    static XINPUT_PAD: AtomicBool = AtomicBool::new(false);
++
++    fn xinput_connected() -> bool {
++        // SAFETY: XInputGetState writes one XINPUT_STATE (plain data, all zeros valid) to the pointer it is given
++        (0..4).any(|slot| unsafe {
++            let mut state: XINPUT_STATE = std::mem::zeroed();
++            XInputGetState(slot, &mut state) == 0
++        })
++    }
 +
 +    static OPEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
 +
@@ -189,6 +205,17 @@ index 0000000..3dc2bb6
 +            let mut warned: HashSet<String> = HashSet::new();
 +            let mut seen: HashSet<String> = HashSet::new();
 +            loop {
++                let xinput = xinput_connected();
++                if XINPUT_PAD.swap(xinput, Relaxed) != xinput && !OPEN.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
++                    eprintln!(
++                        "[hid] {}",
++                        if xinput {
++                            "an XInput pad is connected: the HID pads are left to it"
++                        } else {
++                            "no XInput pad: reading the HID pads"
++                        }
++                    );
++                }
 +                let paths = device_paths();
 +                rejected.retain(|p| paths.contains(p));
 +                warned.retain(|p| paths.contains(p));
@@ -308,8 +335,12 @@ index 0000000..3dc2bb6
 +                )
 +            };
 +            if handle == INVALID_HANDLE_VALUE {
++                // SAFETY: reads the calling thread's last error
++                let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
 +                if sony_path && warned.insert(path.to_string()) {
-+                    eprintln!("[hid] a Sony pad could not be opened (another program, such as DS4Windows or Steam, has it): {path}");
++                    eprintln!(
++                        "[hid] a Sony pad could not be opened (Windows error {error}). HidHide, DS4Windows or Steam is probably hiding it from this                          program: add mh3u-tools.exe to HidHide's application list (the launcher offers to), or run DSX/DS4Windows, which make an                          Xbox pad that works as it is: {path}"
++                    );
 +                }
 +                return if sony_path { Open::Retry } else { Open::Skip };
 +            }
@@ -499,6 +530,7 @@ index 0000000..3dc2bb6
 +            let mut last = State::default();
 +            let mut applied = Instant::now();
 +            let mut first = true;
++            let mut unread = false;
 +            loop {
 +                let mut read = 0u32;
 +                // SAFETY: `buffer` has `report_len` bytes and the handle is this device's, open until the end of this function
@@ -522,13 +554,30 @@ index 0000000..3dc2bb6
 +                        None
 +                    }
 +                });
-+                let Some(state) = state else { continue };
++                let Some(state) = state else {
++                    if !unread {
++                        unread = true;
++                        eprintln!(
++                            "[hid] report not understood from {:04x}:{:04x}: id 0x{:02x}, {n} bytes",
++                            self.vendor, self.product, buffer[0]
++                        );
++                    }
++                    continue;
++                };
 +                if first {
 +                    eprintln!(
 +                        "[hid] first report from {:04x}:{:04x}: id 0x{:02x}, {n} bytes",
 +                        self.vendor, self.product, buffer[0]
 +                    );
 +                    first = false;
++                }
++                if XINPUT_PAD.load(Relaxed) {
++                    // an XInput pad serves the game: let go of what this one held and stay quiet
++                    if last != State::default() {
++                        apply(State::default(), last);
++                        last = State::default();
++                    }
++                    continue;
 +                }
 +                if state != last || applied.elapsed() >= REFRESH {
 +                    apply(state, last);

@@ -22,6 +22,7 @@ import re
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import customtkinter as ctk
+import hidhide
 from PIL import Image
 import socket
 import webbrowser
@@ -56,7 +57,7 @@ _TH["CTkComboBox"].update({"button_color": ["#3b6073", "#3b6073"], "button_hover
 _TH["CTkEntry"].update({"fg_color": ["#fff6e0", "#0d1820"], "border_color": ["#b9a97f", "#2b4a58"]})
 _TH["CTkScrollbar"].update({"button_color": ["#3b6073", "#3b6073"], "button_hover_color": ["#c98f2b", "#c98f2b"]})
 
-APP_VERSION = "v0.8.6"
+APP_VERSION = "v0.8.7"
 
 # Header update widget colors (state -> label color) and button looks: (fg, hover)
 UPDATE_COLORS = {"info": "#9db3ba", "ok": "#7fcfa6", "warn": "#eab84c", "error": "#e07a6f"}
@@ -2086,6 +2087,36 @@ class MH3ULauncherApp(ctk.CTk):
             self._queue_server_log(f"[Launcher] No se pudo elevar permisos para el firewall: {e}")
             return False
 
+    def _offer_hidhide_access(self):
+        """HidHide (left by DSX / DS4Windows setups) hides the gamepad from mh3u-tools.exe: offer to allow it."""
+        if not self.config.get("hidhide_ask", True):
+            return
+        try:
+            tools = self._tools_exe_path()
+            cli = hidhide.hidden_pad_cli(tools)
+            if not cli:
+                return
+            if not messagebox.askyesno(
+                "Mando oculto por HidHide",
+                "HidHide está ocultando tu mando (PS5/PS4) de los programas que no están en su lista, así que "
+                "el juego no lo verá.\n\n"
+                "¿Permitir a MH3U leerlo? Se añade mh3u-tools.exe a la lista de HidHide (pide permisos de "
+                "administrador y se puede quitar con HidHideCLI --app-unreg).\n\n"
+                "Si eliges No, no se volverá a preguntar; también puedes abrir DSX o DS4Windows antes de jugar.",
+            ):
+                self.config["hidhide_ask"] = False
+                self.save_config()
+                return
+            self._run_elevated_batch([hidhide.allow_command(cli, tools)])
+            if hidhide.is_allowed(cli, tools):
+                messagebox.showinfo("Mando permitido", "Listo: MH3U ya puede leer tu mando.")
+            else:
+                messagebox.showwarning(
+                    "HidHide", "No se pudo añadir mh3u-tools.exe a HidHide. Añádelo a mano en HidHide Configuration Client."
+                )
+        except Exception as e:
+            self._queue_server_log(f"[Launcher] Comprobación de HidHide omitida: {e}")
+
     def _tools_exe_path(self):
         res = get_tools_path()
         return res[0] if isinstance(res, tuple) else res
@@ -2655,6 +2686,8 @@ class MH3ULauncherApp(ctk.CTk):
             ):
                 self.start_build_process()
             return
+
+        self._offer_hidhide_access()
 
         # Prepare arguments
         run_args = [tools, "run", games_dir, out_dir, "--window", "--max-imports", "1000000000000"]
