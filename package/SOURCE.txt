@@ -11,6 +11,8 @@ Este paquete se distribuye bajo la GNU Affero General Public License v3.0
    Original : https://github.com/glinesbdev/mh3u-port  (commit base 41d3a9b)
    Cambios  : carpeta source-patches/ del repositorio (1), parches 0001, 0002 y 0003,
               con instrucciones para reproducir el binario.
+   Incluye el escalado AMD FidelityFX Super Resolution 1.0 (EASU + RCAS, licencia MIT,
+              Copyright (c) 2021 Advanced Micro Devices, Inc.; aviso completo en THIRD_PARTY.md del repositorio (1)).
 
 3) server.exe  (mh3u-revival de Matt-Wood-23, SIN modificar, version v0.2.0-beta)
    https://github.com/Matt-Wood-23/mh3u-revival/tree/v0.2.0-beta

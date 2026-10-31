@@ -1,13 +1,13 @@
 ---
-name: Reporte de error
-about: Algo no funciona en el launcher o en el modo online
+name: Bug report
+about: Something does not work in the launcher or in the online mode
 labels: bug
 ---
 
-**Versión del launcher** (pestaña de créditos):
+**Launcher version** (Partidas & Logs tab, credits):
 **Windows / GPU / CPU:**
-**Qué pasó y qué esperabas:**
-**Pasos para reproducirlo:**
-**Logs** (`mh3u_latest.log` y, si es online, `server.log`; sin datos personales):
+**What happened and what did you expect:**
+**Steps to reproduce:**
+**Logs** (`mh3u_latest.log` and, if it is about online, `server.log`; no personal data):
 
-> No adjuntes archivos del juego.
+> Do not attach game files.

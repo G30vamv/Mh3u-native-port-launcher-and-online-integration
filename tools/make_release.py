@@ -77,7 +77,7 @@ def build_zip(src, rels, version, out):
 
 
 def launcher_version(src):
-    for candidate in (os.path.join(src, "mh3u_launcher.py"), os.path.join(os.path.dirname(__file__), "..", "launcher", "mh3u_launcher.py")):
+    for candidate in (os.path.join(os.path.dirname(__file__), "..", "launcher", "core.py"),):
         if os.path.isfile(candidate):
             m = re.search(r'^APP_VERSION\s*=\s*"([^"]+)"', open(candidate, encoding="utf-8").read(), re.M)
             if m:
@@ -96,7 +96,7 @@ def main():
 
     found = launcher_version(args.dir)
     if found and found != args.version:
-        sys.exit(f"APP_VERSION in mh3u_launcher.py is {found}, not {args.version}. Fix one of them first.")
+        sys.exit(f"APP_VERSION in launcher/core.py is {found}, not {args.version}. Fix one of them first.")
     if not os.path.isfile(os.path.join(args.dir, "MH3U.exe")):
         sys.exit("MH3U.exe not found in --dir")
 

@@ -10,6 +10,15 @@ index 4a4e526..f98f43a 100644
 +[profile.release]
 +lto = "fat"
 +codegen-units = 1
+diff --git a/crates/mh3u-gfx/Cargo.toml b/crates/mh3u-gfx/Cargo.toml
+index 1154894..b87b0eb 100644
+--- a/crates/mh3u-gfx/Cargo.toml
++++ b/crates/mh3u-gfx/Cargo.toml
+@@ -26,3 +26,4 @@ xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
+ [dev-dependencies]
+ # the tests time the draw path on a device that does nothing
+ wgpu = { version = "30", features = ["noop"] }
++naga = { version = "30", features = ["wgsl-in"] }
 diff --git a/crates/mh3u-gfx/src/draw.rs b/crates/mh3u-gfx/src/draw.rs
 index d51f209..b6a34d8 100644
 --- a/crates/mh3u-gfx/src/draw.rs
@@ -55,9 +64,643 @@ index d51f209..b6a34d8 100644
          }
          for a in self.batch.arenas.iter_mut().flatten() {
              a.used = 0;
+diff --git a/crates/mh3u-gfx/src/fsr.rs b/crates/mh3u-gfx/src/fsr.rs
+new file mode 100644
+index 0000000..0243dbd
+--- /dev/null
++++ b/crates/mh3u-gfx/src/fsr.rs
+@@ -0,0 +1,628 @@
++//! AMD FidelityFX Super Resolution 1.0 (spatial): EASU upscales the picture to the size it is shown at, RCAS sharpens it.
++//!
++//! The shaders are a WGSL port of `ffx_fsr1.h` (v1.20210629) from GPUOpen-Effects/FidelityFX-FSR, kept to the same maths
++//! (32-bit float path, `FsrEasuF` and `FsrRcasF`), which is distributed under this licence:
++//!
++//! Copyright (c) 2021 Advanced Micro Devices, Inc. All rights reserved.
++//! Permission is hereby granted, free of charge, to any person obtaining a copy
++//! of this software and associated documentation files(the "Software"), to deal
++//! in the Software without restriction, including without limitation the rights
++//! to use, copy, modify, merge, publish, distribute, sublicense, and / or sell
++//! copies of the Software, and to permit persons to whom the Software is
++//! furnished to do so, subject to the following conditions :
++//! The above copyright notice and this permission notice shall be included in
++//! all copies or substantial portions of the Software.
++//! THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++//! IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++//! FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE
++//! AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++//! LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++//! OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++//! THE SOFTWARE.
++//!
++//! FSR 1 only upscales, so when the picture is already as large as the place it is shown at (an internal scale of 2x or
++//! more on a 1080p window) the first pass is a plain filtered copy and RCAS still sharpens the result.
++
++/// The format of the picture between the two passes: wide enough to hold EASU's output without rounding it.
++const MID_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
++
++const VERTEX: &str = r#"
++struct Out { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32> };
++
++@vertex fn vs(@builtin(vertex_index) i: u32) -> Out {
++    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
++    var o: Out;
++    o.position = vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
++    o.uv = vec2<f32>(p.x, 1.0 - p.y);
++    return o;
++}
++"#;
++
++const EASU: &str = r#"
++struct Params { out_size: vec2<f32>, pad: vec2<f32> };
++@group(0) @binding(0) var picture: texture_2d<f32>;
++@group(0) @binding(1) var picture_sampler: sampler;
++@group(0) @binding(2) var<uniform> params: Params;
++
++fn rcp_lo(a: f32) -> f32 { return bitcast<f32>(0x7ef07ebbu - bitcast<u32>(a)); }
++fn rsq_lo(a: f32) -> f32 { return bitcast<f32>(0x5f347d74u - (bitcast<u32>(a) >> 1u)); }
++
++fn easu_tap(acc: ptr<function, vec3<f32>>, wsum: ptr<function, f32>, off: vec2<f32>, dir: vec2<f32>, len: vec2<f32>,
++            lob: f32, clp: f32, c: vec3<f32>) {
++    var v = vec2<f32>(off.x * dir.x + off.y * dir.y, off.x * (-dir.y) + off.y * dir.x);
++    v = v * len;
++    let d2 = min(v.x * v.x + v.y * v.y, clp);
++    var wb = 2.0 / 5.0 * d2 - 1.0;
++    var wa = lob * d2 - 1.0;
++    wb = wb * wb;
++    wa = wa * wa;
++    wb = 25.0 / 16.0 * wb - (25.0 / 16.0 - 1.0);
++    let w = wb * wa;
++    *acc = *acc + c * w;
++    *wsum = *wsum + w;
++}
++
++fn easu_set(dir: ptr<function, vec2<f32>>, len: ptr<function, f32>, w: f32, la: f32, lb: f32, lc: f32, ld: f32, le: f32) {
++    let dc = ld - lc;
++    let cb = lc - lb;
++    var len_x = rcp_lo(max(abs(dc), abs(cb)));
++    let dir_x = ld - lb;
++    (*dir).x = (*dir).x + dir_x * w;
++    len_x = saturate(abs(dir_x) * len_x);
++    len_x = len_x * len_x;
++    *len = *len + len_x * w;
++    let ec = le - lc;
++    let ca = lc - la;
++    var len_y = rcp_lo(max(abs(ec), abs(ca)));
++    let dir_y = le - la;
++    (*dir).y = (*dir).y + dir_y * w;
++    len_y = saturate(abs(dir_y) * len_y);
++    len_y = len_y * len_y;
++    *len = *len + len_y * w;
++}
++
++@fragment fn fs(in: Out) -> @location(0) vec4<f32> {
++    let ip = floor(in.position.xy);
++    let in_size = vec2<f32>(textureDimensions(picture));
++    let scale = in_size / params.out_size;
++    var pp = ip * scale + (0.5 * scale - 0.5);
++    let fp = floor(pp);
++    pp = pp - fp;
++
++    let rcp = 1.0 / in_size;
++    let p0 = fp * rcp + vec2<f32>(1.0, -1.0) * rcp;
++    let p1 = p0 + vec2<f32>(-1.0, 2.0) * rcp;
++    let p2 = p0 + vec2<f32>(1.0, 2.0) * rcp;
++    let p3 = p0 + vec2<f32>(0.0, 4.0) * rcp;
++
++    // gather order: x = lower left, y = lower right, z = upper right, w = upper left
++    let bczz_r = textureGather(0, picture, picture_sampler, p0);
++    let bczz_g = textureGather(1, picture, picture_sampler, p0);
++    let bczz_b = textureGather(2, picture, picture_sampler, p0);
++    let ijfe_r = textureGather(0, picture, picture_sampler, p1);
++    let ijfe_g = textureGather(1, picture, picture_sampler, p1);
++    let ijfe_b = textureGather(2, picture, picture_sampler, p1);
++    let klhg_r = textureGather(0, picture, picture_sampler, p2);
++    let klhg_g = textureGather(1, picture, picture_sampler, p2);
++    let klhg_b = textureGather(2, picture, picture_sampler, p2);
++    let zzon_r = textureGather(0, picture, picture_sampler, p3);
++    let zzon_g = textureGather(1, picture, picture_sampler, p3);
++    let zzon_b = textureGather(2, picture, picture_sampler, p3);
++
++    // luma times 2
++    let bczz_l = bczz_b * 0.5 + (bczz_r * 0.5 + bczz_g);
++    let ijfe_l = ijfe_b * 0.5 + (ijfe_r * 0.5 + ijfe_g);
++    let klhg_l = klhg_b * 0.5 + (klhg_r * 0.5 + klhg_g);
++    let zzon_l = zzon_b * 0.5 + (zzon_r * 0.5 + zzon_g);
++    let b_l = bczz_l.x;
++    let c_l = bczz_l.y;
++    let i_l = ijfe_l.x;
++    let j_l = ijfe_l.y;
++    let f_l = ijfe_l.z;
++    let e_l = ijfe_l.w;
++    let k_l = klhg_l.x;
++    let l_l = klhg_l.y;
++    let h_l = klhg_l.z;
++    let g_l = klhg_l.w;
++    let o_l = zzon_l.z;
++    let n_l = zzon_l.w;
++
++    var dir = vec2<f32>(0.0);
++    var len = 0.0;
++    easu_set(&dir, &len, (1.0 - pp.x) * (1.0 - pp.y), b_l, e_l, f_l, g_l, j_l);
++    easu_set(&dir, &len, pp.x * (1.0 - pp.y), c_l, f_l, g_l, h_l, k_l);
++    easu_set(&dir, &len, (1.0 - pp.x) * pp.y, f_l, i_l, j_l, k_l, n_l);
++    easu_set(&dir, &len, pp.x * pp.y, g_l, j_l, k_l, l_l, o_l);
++
++    let dir2 = dir * dir;
++    var dir_r = dir2.x + dir2.y;
++    let zro = dir_r < 1.0 / 32768.0;
++    dir_r = rsq_lo(dir_r);
++    if (zro) { dir_r = 1.0; dir.x = 1.0; }
++    dir = dir * dir_r;
++    len = len * 0.5;
++    len = len * len;
++    let stretch = (dir.x * dir.x + dir.y * dir.y) * rcp_lo(max(abs(dir.x), abs(dir.y)));
++    let len2 = vec2<f32>(1.0 + (stretch - 1.0) * len, 1.0 + -0.5 * len);
++    let lob = 0.5 + ((1.0 / 4.0 - 0.04) - 0.5) * len;
++    let clp = rcp_lo(lob);
++
++    let f_c = vec3<f32>(ijfe_r.z, ijfe_g.z, ijfe_b.z);
++    let g_c = vec3<f32>(klhg_r.w, klhg_g.w, klhg_b.w);
++    let j_c = vec3<f32>(ijfe_r.y, ijfe_g.y, ijfe_b.y);
++    let k_c = vec3<f32>(klhg_r.x, klhg_g.x, klhg_b.x);
++    let min4 = min(min(f_c, min(g_c, j_c)), k_c);
++    let max4 = max(max(f_c, max(g_c, j_c)), k_c);
++
++    var acc = vec3<f32>(0.0);
++    var wsum = 0.0;
++    easu_tap(&acc, &wsum, vec2<f32>(0.0, -1.0) - pp, dir, len2, lob, clp, vec3<f32>(bczz_r.x, bczz_g.x, bczz_b.x)); // b
++    easu_tap(&acc, &wsum, vec2<f32>(1.0, -1.0) - pp, dir, len2, lob, clp, vec3<f32>(bczz_r.y, bczz_g.y, bczz_b.y)); // c
++    easu_tap(&acc, &wsum, vec2<f32>(-1.0, 1.0) - pp, dir, len2, lob, clp, vec3<f32>(ijfe_r.x, ijfe_g.x, ijfe_b.x)); // i
++    easu_tap(&acc, &wsum, vec2<f32>(0.0, 1.0) - pp, dir, len2, lob, clp, vec3<f32>(ijfe_r.y, ijfe_g.y, ijfe_b.y)); // j
++    easu_tap(&acc, &wsum, vec2<f32>(0.0, 0.0) - pp, dir, len2, lob, clp, vec3<f32>(ijfe_r.z, ijfe_g.z, ijfe_b.z)); // f
++    easu_tap(&acc, &wsum, vec2<f32>(-1.0, 0.0) - pp, dir, len2, lob, clp, vec3<f32>(ijfe_r.w, ijfe_g.w, ijfe_b.w)); // e
++    easu_tap(&acc, &wsum, vec2<f32>(1.0, 1.0) - pp, dir, len2, lob, clp, vec3<f32>(klhg_r.x, klhg_g.x, klhg_b.x)); // k
++    easu_tap(&acc, &wsum, vec2<f32>(2.0, 1.0) - pp, dir, len2, lob, clp, vec3<f32>(klhg_r.y, klhg_g.y, klhg_b.y)); // l
++    easu_tap(&acc, &wsum, vec2<f32>(2.0, 0.0) - pp, dir, len2, lob, clp, vec3<f32>(klhg_r.z, klhg_g.z, klhg_b.z)); // h
++    easu_tap(&acc, &wsum, vec2<f32>(1.0, 0.0) - pp, dir, len2, lob, clp, vec3<f32>(klhg_r.w, klhg_g.w, klhg_b.w)); // g
++    easu_tap(&acc, &wsum, vec2<f32>(1.0, 2.0) - pp, dir, len2, lob, clp, vec3<f32>(zzon_r.z, zzon_g.z, zzon_b.z)); // o
++    easu_tap(&acc, &wsum, vec2<f32>(0.0, 2.0) - pp, dir, len2, lob, clp, vec3<f32>(zzon_r.w, zzon_g.w, zzon_b.w)); // n
++
++    let pix = min(max4, max(min4, acc * (1.0 / wsum)));
++    return vec4<f32>(pix, 1.0);
++}
++"#;
++
++/// RCAS; `{sharp}` is 2^-stops (1.0 is the strongest the filter allows, as in `FsrRcasCon`).
++const RCAS: &str = r#"
++@group(0) @binding(0) var picture: texture_2d<f32>;
++
++fn load(p: vec2<i32>) -> vec3<f32> {
++    let last = vec2<i32>(textureDimensions(picture)) - vec2<i32>(1);
++    return textureLoad(picture, clamp(p, vec2<i32>(0), last), 0).rgb;
++}
++
++fn max3(a: f32, b: f32, c: f32) -> f32 { return max(a, max(b, c)); }
++
++@fragment fn fs(in: Out) -> @location(0) vec4<f32> {
++    let sp = vec2<i32>(floor(in.uv * vec2<f32>(textureDimensions(picture))));
++    let b = load(sp + vec2<i32>(0, -1));
++    let d = load(sp + vec2<i32>(-1, 0));
++    let e = load(sp);
++    let f = load(sp + vec2<i32>(1, 0));
++    let h = load(sp + vec2<i32>(0, 1));
++
++    let mn4 = min(min(b, min(d, f)), h);
++    let mx4 = max(max(b, max(d, f)), h);
++    // the denominators are kept off zero: the reference relies on a hardware reciprocal giving infinity there
++    let hit_min = min(mn4, e) / max(4.0 * mx4, vec3<f32>(1e-6));
++    let hit_max = (1.0 - max(mx4, e)) / min(4.0 * mn4 - 4.0, vec3<f32>(-1e-6));
++    let lobe_c = max(-hit_min, hit_max);
++    let lobe = max(-(0.25 - 1.0 / 16.0), min(max3(lobe_c.r, lobe_c.g, lobe_c.b), 0.0)) * {sharp};
++    let pix = (lobe * (b + d + h + f) + e) / (4.0 * lobe + 1.0);
++    return vec4<f32>(pix, 1.0);
++}
++"#;
++
++struct Mid {
++    width: u32,
++    height: u32,
++    view: wgpu::TextureView,
++    params: wgpu::Buffer,
++    /// RCAS reads the picture EASU made.
++    rcas_group: wgpu::BindGroup,
++}
++
++pub(crate) struct Fsr {
++    easu: wgpu::RenderPipeline,
++    easu_layout: wgpu::BindGroupLayout,
++    /// The first pass when the picture is not smaller than where it goes: a filtered copy (made with the caller's layout).
++    plain: wgpu::RenderPipeline,
++    rcas: wgpu::RenderPipeline,
++    rcas_layout: wgpu::BindGroupLayout,
++    mid: Option<Mid>,
++}
++
++fn pipeline(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, source: String, format: wgpu::TextureFormat) -> wgpu::RenderPipeline {
++    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
++        label: Some("fsr"),
++        source: wgpu::ShaderSource::Wgsl(source.into()),
++    });
++    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
++        label: None,
++        bind_group_layouts: &[Some(layout)],
++        immediate_size: 0,
++    });
++    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
++        label: Some("fsr"),
++        layout: Some(&pipeline_layout),
++        vertex: wgpu::VertexState {
++            module: &module,
++            entry_point: Some("vs"),
++            compilation_options: Default::default(),
++            buffers: &[],
++        },
++        fragment: Some(wgpu::FragmentState {
++            module: &module,
++            entry_point: Some("fs"),
++            compilation_options: Default::default(),
++            targets: &[Some(format.into())],
++        }),
++        primitive: wgpu::PrimitiveState::default(),
++        depth_stencil: None,
++        multisample: wgpu::MultisampleState::default(),
++        multiview_mask: None,
++        cache: None,
++    })
++}
++
++fn texture_entry(binding: u32, filterable: bool) -> wgpu::BindGroupLayoutEntry {
++    wgpu::BindGroupLayoutEntry {
++        binding,
++        visibility: wgpu::ShaderStages::FRAGMENT,
++        ty: wgpu::BindingType::Texture {
++            sample_type: wgpu::TextureSampleType::Float { filterable },
++            view_dimension: wgpu::TextureViewDimension::D2,
++            multisampled: false,
++        },
++        count: None,
++    }
++}
++
++/// RCAS's `sharpness` in stops (0 is the strongest, each stop halves it) from the launcher's 0 to 1 amount.
++pub(crate) fn rcas_stops(amount: f32) -> f32 {
++    ((1.0 - amount.clamp(0.0, 1.0)) * 2.0).clamp(0.0, 2.0)
++}
++
++impl Fsr {
++    /// `blit_layout` is the layout of the plain copy (picture and sampler); `copy_source` its shader.
++    pub(crate) fn new(
++        device: &wgpu::Device,
++        surface_format: wgpu::TextureFormat,
++        blit_layout: &wgpu::BindGroupLayout,
++        copy_source: String,
++        sharpness: f32,
++    ) -> Fsr {
++        let easu_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++            label: None,
++            entries: &[
++                texture_entry(0, true),
++                wgpu::BindGroupLayoutEntry {
++                    binding: 1,
++                    visibility: wgpu::ShaderStages::FRAGMENT,
++                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
++                    count: None,
++                },
++                wgpu::BindGroupLayoutEntry {
++                    binding: 2,
++                    visibility: wgpu::ShaderStages::FRAGMENT,
++                    ty: wgpu::BindingType::Buffer {
++                        ty: wgpu::BufferBindingType::Uniform,
++                        has_dynamic_offset: false,
++                        min_binding_size: None,
++                    },
++                    count: None,
++                },
++            ],
++        });
++        let rcas_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++            label: None,
++            entries: &[texture_entry(0, false)],
++        });
++        let sharp = 2f32.powf(-rcas_stops(sharpness));
++        let rcas_source = format!("{VERTEX}{}", RCAS.replace("{sharp}", &format!("{sharp:.6}")));
++        Fsr {
++            easu: pipeline(device, &easu_layout, format!("{VERTEX}{EASU}"), MID_FORMAT),
++            easu_layout,
++            plain: pipeline(device, blit_layout, copy_source, MID_FORMAT),
++            rcas: pipeline(device, &rcas_layout, rcas_source, surface_format),
++            rcas_layout,
++            mid: None,
++        }
++    }
++
++    #[allow(clippy::too_many_arguments)]
++    /// Runs the first pass: the picture `tv`, at `width` x `height` (the size it is shown at), into the middle texture.
++    pub(crate) fn first_pass(
++        &mut self,
++        device: &wgpu::Device,
++        queue: &crate::queue::OrderedQueue,
++        enc: &mut wgpu::CommandEncoder,
++        tv: &wgpu::Texture,
++        sampler: &wgpu::Sampler,
++        copy_layout: &wgpu::BindGroupLayout,
++        width: u32,
++        height: u32,
++    ) {
++        let stale = self.mid.as_ref().is_none_or(|m| m.width != width || m.height != height);
++        if stale {
++            let texture = device.create_texture(&wgpu::TextureDescriptor {
++                label: Some("fsr"),
++                size: wgpu::Extent3d {
++                    width,
++                    height,
++                    depth_or_array_layers: 1,
++                },
++                mip_level_count: 1,
++                sample_count: 1,
++                dimension: wgpu::TextureDimension::D2,
++                format: MID_FORMAT,
++                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
++                view_formats: &[],
++            });
++            let view = texture.create_view(&Default::default());
++            let params = device.create_buffer(&wgpu::BufferDescriptor {
++                label: Some("fsr"),
++                size: 16,
++                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
++                mapped_at_creation: false,
++            });
++            let mut bytes = [0u8; 16];
++            bytes[0..4].copy_from_slice(&(width as f32).to_le_bytes());
++            bytes[4..8].copy_from_slice(&(height as f32).to_le_bytes());
++            queue.write_buffer(&params, 0, &bytes);
++            let rcas_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
++                label: None,
++                layout: &self.rcas_layout,
++                entries: &[wgpu::BindGroupEntry {
++                    binding: 0,
++                    resource: wgpu::BindingResource::TextureView(&view),
++                }],
++            });
++            self.mid = Some(Mid {
++                width,
++                height,
++                view,
++                params,
++                rcas_group,
++            });
++        }
++        let mid = self.mid.as_ref().expect("made above");
++        let tv_view = tv.create_view(&Default::default());
++        // EASU only makes sense where the picture grows
++        let upscaling = tv.width() < width || tv.height() < height;
++        let (pipeline, group) = if upscaling {
++            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
++                label: None,
++                layout: &self.easu_layout,
++                entries: &[
++                    wgpu::BindGroupEntry {
++                        binding: 0,
++                        resource: wgpu::BindingResource::TextureView(&tv_view),
++                    },
++                    wgpu::BindGroupEntry {
++                        binding: 1,
++                        resource: wgpu::BindingResource::Sampler(sampler),
++                    },
++                    wgpu::BindGroupEntry {
++                        binding: 2,
++                        resource: mid.params.as_entire_binding(),
++                    },
++                ],
++            });
++            (&self.easu, group)
++        } else {
++            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
++                label: None,
++                layout: copy_layout,
++                entries: &[
++                    wgpu::BindGroupEntry {
++                        binding: 0,
++                        resource: wgpu::BindingResource::TextureView(&tv_view),
++                    },
++                    wgpu::BindGroupEntry {
++                        binding: 1,
++                        resource: wgpu::BindingResource::Sampler(sampler),
++                    },
++                ],
++            });
++            (&self.plain, group)
++        };
++        let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
++            label: Some("fsr easu"),
++            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
++                view: &mid.view,
++                depth_slice: None,
++                resolve_target: None,
++                ops: wgpu::Operations {
++                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
++                    store: wgpu::StoreOp::Store,
++                },
++            })],
++            depth_stencil_attachment: None,
++            timestamp_writes: None,
++            occlusion_query_set: None,
++            multiview_mask: None,
++        });
++        pass.set_pipeline(pipeline);
++        pass.set_bind_group(0, &group, &[]);
++        pass.draw(0..3, 0..1);
++    }
++
++    /// Draws the sharpened picture into the pass that presents (the viewport is set by the caller). Needs `first_pass` first.
++    pub(crate) fn second_pass(&self, pass: &mut wgpu::RenderPass<'_>) {
++        if let Some(mid) = &self.mid {
++            pass.set_pipeline(&self.rcas);
++            pass.set_bind_group(0, &mid.rcas_group, &[]);
++            pass.draw(0..3, 0..1);
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn rcas_stops_follow_the_launcher_amount() {
++        assert_eq!(rcas_stops(1.0), 0.0);
++        assert_eq!(rcas_stops(0.5), 1.0);
++        assert_eq!(rcas_stops(0.0), 2.0);
++        assert_eq!(rcas_stops(7.0), 0.0);
++    }
++
++    #[test]
++    fn shaders_parse() {
++        for source in [
++            format!("{VERTEX}{EASU}"),
++            format!("{VERTEX}{}", RCAS.replace("{sharp}", "0.707107")),
++        ] {
++            let module = naga::front::wgsl::parse_str(&source).expect("wgsl parses");
++            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
++                .validate(&module)
++                .expect("wgsl validates");
++        }
++    }
++
++    /// Runs both passes on a real adapter (`cargo test -p mh3u-gfx fsr -- --ignored`): a flat picture must stay flat and
++    /// a black/white edge must stay an edge.
++    #[test]
++    #[ignore = "needs a graphics adapter"]
++    fn both_passes_run_on_a_real_adapter() {
++        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
++        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).expect("adapter");
++        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).expect("device");
++        let queue = crate::queue::OrderedQueue::new(queue, false);
++        let format = wgpu::TextureFormat::Bgra8Unorm;
++        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++            label: None,
++            entries: &[
++                texture_entry(0, true),
++                wgpu::BindGroupLayoutEntry {
++                    binding: 1,
++                    visibility: wgpu::ShaderStages::FRAGMENT,
++                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
++                    count: None,
++                },
++            ],
++        });
++        let copy = format!(
++            "{VERTEX}@group(0) @binding(0) var picture: texture_2d<f32>;
++@group(0) @binding(1) var picture_sampler: sampler;
++             @fragment fn fs(in: Out) -> @location(0) vec4<f32> {{ return textureSample(picture, picture_sampler, in.uv); }}"
++        );
++        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
++            mag_filter: wgpu::FilterMode::Linear,
++            min_filter: wgpu::FilterMode::Linear,
++            ..Default::default()
++        });
++        for (name, edge) in [("flat", false), ("edge", true)] {
++            let (iw, ih, ow, oh) = (64u32, 36u32, 128u32, 72u32);
++            let texels: Vec<u8> = (0..iw * ih)
++                .flat_map(|i| {
++                    let v = if !edge {
++                        128
++                    } else if i % iw < iw / 2 {
++                        0
++                    } else {
++                        255
++                    };
++                    [v, v, v, 255]
++                })
++                .collect();
++            let tv = device.create_texture(&wgpu::TextureDescriptor {
++                label: None,
++                size: wgpu::Extent3d {
++                    width: iw,
++                    height: ih,
++                    depth_or_array_layers: 1,
++                },
++                mip_level_count: 1,
++                sample_count: 1,
++                dimension: wgpu::TextureDimension::D2,
++                format: wgpu::TextureFormat::Rgba8Unorm,
++                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
++                view_formats: &[],
++            });
++            queue.write_texture(
++                tv.as_image_copy(),
++                &texels,
++                wgpu::TexelCopyBufferLayout {
++                    offset: 0,
++                    bytes_per_row: Some(iw * 4),
++                    rows_per_image: Some(ih),
++                },
++                wgpu::Extent3d {
++                    width: iw,
++                    height: ih,
++                    depth_or_array_layers: 1,
++                },
++            );
++            let out = device.create_texture(&wgpu::TextureDescriptor {
++                label: None,
++                size: wgpu::Extent3d {
++                    width: ow,
++                    height: oh,
++                    depth_or_array_layers: 1,
++                },
++                mip_level_count: 1,
++                sample_count: 1,
++                dimension: wgpu::TextureDimension::D2,
++                format,
++                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
++                view_formats: &[],
++            });
++            let mut fsr = Fsr::new(&device, format, &layout, copy.clone(), 0.75);
++            let mut enc = device.create_command_encoder(&Default::default());
++            fsr.first_pass(&device, &queue, &mut enc, &tv, &sampler, &layout, ow, oh);
++            {
++                let view = out.create_view(&Default::default());
++                let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
++                    label: None,
++                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
++                        view: &view,
++                        depth_slice: None,
++                        resolve_target: None,
++                        ops: wgpu::Operations {
++                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
++                            store: wgpu::StoreOp::Store,
++                        },
++                    })],
++                    depth_stencil_attachment: None,
++                    timestamp_writes: None,
++                    occlusion_query_set: None,
++                    multiview_mask: None,
++                });
++                fsr.second_pass(&mut pass);
++            }
++            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
++                label: None,
++                size: (ow * oh * 4) as u64,
++                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
++                mapped_at_creation: false,
++            });
++            enc.copy_texture_to_buffer(
++                out.as_image_copy(),
++                wgpu::TexelCopyBufferInfo {
++                    buffer: &buffer,
++                    layout: wgpu::TexelCopyBufferLayout {
++                        offset: 0,
++                        bytes_per_row: Some(ow * 4),
++                        rows_per_image: Some(oh),
++                    },
++                },
++                wgpu::Extent3d {
++                    width: ow,
++                    height: oh,
++                    depth_or_array_layers: 1,
++                },
++            );
++            queue.submit([enc.finish()]);
++            buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
++            queue.flush();
++            let _ = device.poll(wgpu::PollType::wait_indefinitely());
++            let data = buffer.slice(..).get_mapped_range().expect("mapped").to_vec();
++            let px = |x: u32, y: u32| data[((y * ow + x) * 4 + 1) as usize] as i32;
++            let row: Vec<i32> = (0..ow).map(|x| px(x, oh / 2)).collect();
++            if !edge {
++                assert!(row.iter().all(|v| (v - 128).abs() <= 1), "{name}: {row:?}");
++            } else {
++                assert!(row[..ow as usize / 2 - 6].iter().all(|&v| v <= 2), "{name} left: {row:?}");
++                assert!(row[ow as usize / 2 + 6..].iter().all(|&v| v >= 253), "{name} right: {row:?}");
++                let steps = row.windows(2).filter(|w| w[0] != w[1]).count();
++                assert!(steps <= 8, "{name} edge too soft ({steps} steps): {row:?}");
++            }
++        }
++    }
++}
 diff --git a/crates/mh3u-gfx/src/fxmap.rs b/crates/mh3u-gfx/src/fxmap.rs
 new file mode 100644
-index 0000000..2d837ef
+index 0000000..1e44f3c
 --- /dev/null
 +++ b/crates/mh3u-gfx/src/fxmap.rs
 @@ -0,0 +1,51 @@
@@ -80,11 +723,11 @@ index 0000000..2d837ef
 +impl Hasher for FxHasher {
 +    #[inline]
 +    fn write(&mut self, bytes: &[u8]) {
-+        let mut chunks = bytes.chunks_exact(8);
-+        for c in &mut chunks {
-+            self.add(u64::from_le_bytes(c.try_into().unwrap()));
++        let (chunks, rest) = bytes.as_chunks::<8>();
++        for c in chunks {
++            self.add(u64::from_le_bytes(*c));
 +        }
-+        for &b in chunks.remainder() {
++        for &b in rest {
 +            self.add(b as u64);
 +        }
 +    }
@@ -113,7 +756,7 @@ index 0000000..2d837ef
 +pub type HashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
 +pub type HashSet<K> = std::collections::HashSet<K, BuildHasherDefault<FxHasher>>;
 diff --git a/crates/mh3u-gfx/src/gx2.rs b/crates/mh3u-gfx/src/gx2.rs
-index 1ce1560..0a44513 100644
+index 1ce1560..1b5a1d2 100644
 --- a/crates/mh3u-gfx/src/gx2.rs
 +++ b/crates/mh3u-gfx/src/gx2.rs
 @@ -2,9 +2,9 @@
@@ -127,7 +770,16 @@ index 1ce1560..0a44513 100644
  use std::time::{Duration, Instant};
  
  /// The calls this backend handles, as a compact number: recorded display lists keep this, and calls are dispatched by it, not by name.
-@@ -189,10 +189,14 @@ pub(crate) fn texture_format(gx2: u32) -> wgpu::TextureFormat {
+@@ -124,6 +124,8 @@ pub struct Gx2 {
+     pub(crate) d: Display,
+     pub(crate) config: wgpu::SurfaceConfiguration,
+     blit: wgpu::RenderPipeline,
++    /// AMD FSR 1.0 (two passes) when it is the chosen upscaler; `blit` stays the plain copy.
++    fsr: Option<crate::fsr::Fsr>,
+     layout: wgpu::BindGroupLayout,
+     sampler: wgpu::Sampler,
+     /// The colour buffers the game has used, by the guest address of their image.
+@@ -189,10 +191,14 @@ pub(crate) fn texture_format(gx2: u32) -> wgpu::TextureFormat {
      }
  }
  
@@ -143,7 +795,7 @@ index 1ce1560..0a44513 100644
  @vertex fn vs(@builtin(vertex_index) i: u32) -> Out {
      let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
      var o: Out;
-@@ -200,14 +204,124 @@ struct Out { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>
+@@ -200,14 +206,75 @@ struct Out { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>
      o.uv = vec2<f32>(p.x, 1.0 - p.y);
      return o;
  }
@@ -191,55 +843,6 @@ index 1ce1560..0a44513 100644
 +}}
 +"#
 +        ));
-+    } else if upscaler == "fsr" {
-+        s.push_str(&format!(
-+            r#"
-+fn sample_upscaler(uv: vec2<f32>) -> vec3<f32> {{
-+    let dims = vec2<f32>(textureDimensions(picture));
-+    let texel = 1.0 / dims;
-+
-+    let pp = uv * dims - 0.5;
-+    let fp = fract(pp);
-+
-+    let c0 = textureSample(picture, picture_sampler, uv + vec2<f32>(-0.5, -0.5) * texel).rgb;
-+    let c1 = textureSample(picture, picture_sampler, uv + vec2<f32>( 0.5, -0.5) * texel).rgb;
-+    let c2 = textureSample(picture, picture_sampler, uv + vec2<f32>(-0.5,  0.5) * texel).rgb;
-+    let c3 = textureSample(picture, picture_sampler, uv + vec2<f32>( 0.5,  0.5) * texel).rgb;
-+
-+    let c_top = textureSample(picture, picture_sampler, uv + vec2<f32>(0.0, -1.0) * texel).rgb;
-+    let c_bot = textureSample(picture, picture_sampler, uv + vec2<f32>(0.0,  1.0) * texel).rgb;
-+    let c_lef = textureSample(picture, picture_sampler, uv + vec2<f32>(-1.0, 0.0) * texel).rgb;
-+    let c_rig = textureSample(picture, picture_sampler, uv + vec2<f32>( 1.0, 0.0) * texel).rgb;
-+
-+    let l_weights = vec3<f32>(0.2126, 0.7152, 0.0722);
-+    let l0 = dot(c0, l_weights);
-+    let l1 = dot(c1, l_weights);
-+    let l2 = dot(c2, l_weights);
-+    let l3 = dot(c3, l_weights);
-+
-+    let dir_h = (l1 - l0) + (l3 - l2);
-+    let dir_v = (l2 - l0) + (l3 - l1);
-+    let dir_d1 = (l3 - l0);
-+    let dir_d2 = (l2 - l1);
-+
-+    let edge_strength = clamp(abs(dir_h) + abs(dir_v) + abs(dir_d1) + abs(dir_d2), 0.0, 1.0);
-+
-+    let b_top = mix(c0, c1, fp.x);
-+    let b_bot = mix(c2, c3, fp.x);
-+    let base = mix(b_top, b_bot, fp.y);
-+
-+    let min_c = min(min(c0, c1), min(c2, c3));
-+    let max_c = max(max(c0, c1), max(c2, c3));
-+    let cross_c = (c_top + c_bot + c_lef + c_rig) * 0.25;
-+
-+    let sharpness = {sharpness:.3};
-+    let sharp_amt = mix(0.12, 0.38, edge_strength) * sharpness;
-+    let enhanced = base + (base - cross_c) * sharp_amt;
-+
-+    return clamp(enhanced, min_c, max_c);
-+}}
-+"#
-+        ));
 +    } else {
 +        s.push_str(
 +            r#"
@@ -271,7 +874,7 @@ index 1ce1560..0a44513 100644
              self.overlay = Some(crate::overlay::Overlay::new(dump_base, dir, save_dir));
          }
      }
-@@ -229,12 +343,32 @@ impl Gx2 {
+@@ -229,12 +296,32 @@ impl Gx2 {
          let format = caps.as_ref().map_or(wgpu::TextureFormat::Bgra8Unorm, |caps| {
              caps.formats.iter().copied().find(|f| !f.is_srgb()).unwrap_or(caps.formats[0])
          });
@@ -305,7 +908,7 @@ index 1ce1560..0a44513 100644
              desired_maximum_frame_latency: 2,
              alpha_mode: caps.as_ref().map_or(wgpu::CompositeAlphaMode::Auto, |caps| caps.alpha_modes[0]),
              view_formats: vec![],
-@@ -243,9 +377,20 @@ impl Gx2 {
+@@ -243,9 +330,24 @@ impl Gx2 {
          if let Some(surface) = &d.surface {
              surface.configure(&d.device, &config);
          }
@@ -315,11 +918,15 @@ index 1ce1560..0a44513 100644
 +            .and_then(|v| v.parse().ok())
 +            .unwrap_or(0.75);
 +        match upscaler.as_str() {
-+            "fsr" => eprintln!("[gfx] upscaler: AMD FidelityFX FSR 1.0 (sharpness: {sharpness:.2})"),
++            "fsr" => eprintln!(
++                "[gfx] upscaler: AMD FidelityFX FSR 1.0 (EASU + RCAS, sharpness {sharpness:.2} = {:.2} stops)",
++                crate::fsr::rcas_stops(sharpness)
++            ),
 +            "cas" => eprintln!("[gfx] upscaler: AMD FidelityFX CAS (sharpness: {sharpness:.2})"),
 +            _ => eprintln!("[gfx] upscaler: Bilinear (Off)"),
 +        }
 +        let blit_src = make_blit_shader(&upscaler, sharpness);
++        let copy_src = make_blit_shader("off", sharpness);
          let module = d.device.create_shader_module(wgpu::ShaderModuleDescriptor {
              label: Some("blit"),
 -            source: wgpu::ShaderSource::Wgsl(BLIT.into()),
@@ -327,8 +934,19 @@ index 1ce1560..0a44513 100644
          });
          let layout = d.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
              label: None,
-@@ -307,13 +452,13 @@ impl Gx2 {
+@@ -294,6 +396,7 @@ impl Gx2 {
+             multiview_mask: None,
+             cache: None,
+         });
++        let fsr = (upscaler == "fsr" && d.surface.is_some()).then(|| crate::fsr::Fsr::new(&d.device, format, &layout, copy_src, sharpness));
+         let sampler = d.device.create_sampler(&wgpu::SamplerDescriptor {
+             mag_filter: wgpu::FilterMode::Linear,
+             min_filter: wgpu::FilterMode::Linear,
+@@ -305,15 +408,16 @@ impl Gx2 {
+             d,
+             config,
              blit,
++            fsr,
              layout,
              sampler,
 -            targets: HashMap::new(),
@@ -344,7 +962,7 @@ index 1ce1560..0a44513 100644
              recording: None,
              draws: 0,
              dumped: Default::default(),
-@@ -340,8 +485,8 @@ impl Gx2 {
+@@ -340,8 +444,8 @@ impl Gx2 {
                  .ok()
                  .and_then(|v| v.parse().ok())
                  .unwrap_or(120),
@@ -355,7 +973,7 @@ index 1ce1560..0a44513 100644
              fps: std::env::var_os("MH3U_FPS").map(|_| (Instant::now(), 0)),
              diag: crate::report::Diagnostics::from_env(),
              pipes,
-@@ -573,6 +718,7 @@ impl Gx2 {
+@@ -573,6 +677,7 @@ impl Gx2 {
          self.d.queue.submit([enc.finish()]);
          let slice = buffer.slice(..);
          slice.map_async(wgpu::MapMode::Read, |_| {});
@@ -363,7 +981,7 @@ index 1ce1560..0a44513 100644
          let _ = self.d.device.poll(wgpu::PollType::wait_indefinitely());
          let data = slice.get_mapped_range().ok()?;
          let mut rgba = Vec::with_capacity((w * h * 4) as usize);
-@@ -596,8 +742,11 @@ impl Gx2 {
+@@ -596,8 +701,11 @@ impl Gx2 {
          if size.width != self.config.width || size.height != self.config.height {
              self.config.width = size.width;
              self.config.height = size.height;
@@ -375,7 +993,80 @@ index 1ce1560..0a44513 100644
          let frame = match surface.get_current_texture() {
              wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
              wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-@@ -1110,10 +1259,15 @@ impl Gx2 {
+@@ -608,6 +716,21 @@ impl Gx2 {
+         };
+         let view = frame.texture.create_view(&Default::default());
+         let mut enc = self.d.device.create_command_encoder(&Default::default());
++        // where the picture goes: the window, with the picture's proportions kept
++        let shown = self.tv.as_ref().map(|tv| {
++            let (tw, th) = (tv.width() as f32, tv.height() as f32);
++            let scale = (size.width as f32 / tw).min(size.height as f32 / th);
++            (tw * scale, th * scale)
++        });
++        // FSR's first pass (EASU) makes the picture at the size it is shown at; its second (RCAS) goes in the pass below
++        let fsr_ready = match (&mut self.fsr, &self.tv, shown) {
++            (Some(fsr), Some(tv), Some((w, h))) => {
++                let (w, h) = ((w.round() as u32).clamp(1, size.width), (h.round() as u32).clamp(1, size.height));
++                fsr.first_pass(&self.d.device, &self.d.queue, &mut enc, tv, &self.sampler, &self.layout, w, h);
++                true
++            }
++            _ => false,
++        };
+         {
+             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                 label: Some("present"),
+@@ -625,28 +748,29 @@ impl Gx2 {
+                 occlusion_query_set: None,
+                 multiview_mask: None,
+             });
+-            if let Some(tv) = &self.tv {
+-                let (tw, th) = (tv.width() as f32, tv.height() as f32);
+-                let scale = (size.width as f32 / tw).min(size.height as f32 / th);
+-                let (w, h) = (tw * scale, th * scale);
++            if let (Some(tv), Some((w, h))) = (&self.tv, shown) {
+                 pass.set_viewport((size.width as f32 - w) / 2.0, (size.height as f32 - h) / 2.0, w, h, 0.0, 1.0);
+-                let group = self.d.device.create_bind_group(&wgpu::BindGroupDescriptor {
+-                    label: None,
+-                    layout: &self.layout,
+-                    entries: &[
+-                        wgpu::BindGroupEntry {
+-                            binding: 0,
+-                            resource: wgpu::BindingResource::TextureView(&tv.create_view(&Default::default())),
+-                        },
+-                        wgpu::BindGroupEntry {
+-                            binding: 1,
+-                            resource: wgpu::BindingResource::Sampler(&self.sampler),
+-                        },
+-                    ],
+-                });
+-                pass.set_pipeline(&self.blit);
+-                pass.set_bind_group(0, &group, &[]);
+-                pass.draw(0..3, 0..1);
++                if let (true, Some(fsr)) = (fsr_ready, &self.fsr) {
++                    fsr.second_pass(&mut pass);
++                } else {
++                    let group = self.d.device.create_bind_group(&wgpu::BindGroupDescriptor {
++                        label: None,
++                        layout: &self.layout,
++                        entries: &[
++                            wgpu::BindGroupEntry {
++                                binding: 0,
++                                resource: wgpu::BindingResource::TextureView(&tv.create_view(&Default::default())),
++                            },
++                            wgpu::BindGroupEntry {
++                                binding: 1,
++                                resource: wgpu::BindingResource::Sampler(&self.sampler),
++                            },
++                        ],
++                    });
++                    pass.set_pipeline(&self.blit);
++                    pass.set_bind_group(0, &group, &[]);
++                    pass.draw(0..3, 0..1);
++                }
+             }
+         }
+         if let Some(o) = self.overlay.as_mut() {
+@@ -1110,10 +1234,15 @@ impl Gx2 {
                      }
                  }
                  if let Some((since, at)) = self.fps {
@@ -395,18 +1086,19 @@ index 1ce1560..0a44513 100644
                      }
                  }
 diff --git a/crates/mh3u-gfx/src/lib.rs b/crates/mh3u-gfx/src/lib.rs
-index b64aff0..e392ee2 100644
+index b64aff0..3d32389 100644
 --- a/crates/mh3u-gfx/src/lib.rs
 +++ b/crates/mh3u-gfx/src/lib.rs
-@@ -5,6 +5,7 @@ mod draw;
+@@ -5,6 +5,8 @@ mod draw;
  #[cfg(test)]
  mod draw_bench;
  pub mod events;
++mod fsr;
 +mod fxmap;
  mod geometry;
  mod gx2;
  pub mod icon;
-@@ -12,6 +13,7 @@ pub mod kbm;
+@@ -12,6 +14,7 @@ pub mod kbm;
  pub mod overlay;
  mod perf;
  mod pipelines;
@@ -414,7 +1106,7 @@ index b64aff0..e392ee2 100644
  mod report;
  mod shader_cache;
  mod state;
-@@ -40,7 +42,7 @@ pub struct Display {
+@@ -40,7 +43,7 @@ pub struct Display {
      pub instance: wgpu::Instance,
      pub adapter: wgpu::Adapter,
      pub device: wgpu::Device,
@@ -423,7 +1115,7 @@ index b64aff0..e392ee2 100644
      pub surface: Option<wgpu::Surface<'static>>,
  }
  
-@@ -72,7 +74,7 @@ impl Display {
+@@ -72,7 +75,7 @@ impl Display {
              instance,
              adapter,
              device,
@@ -432,7 +1124,7 @@ index b64aff0..e392ee2 100644
              surface: Some(surface),
          })
      }
-@@ -104,7 +106,7 @@ impl Display {
+@@ -104,7 +107,7 @@ impl Display {
              instance,
              adapter,
              device,

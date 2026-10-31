@@ -59,15 +59,15 @@ def commit_update_files(files_root, rels, version):
     with open(os.path.join(UPDATES_DIR, ".gitattributes"), "w", newline="\n") as f:
         f.write("* -text\n")  # byte-exact: the updater verifies sha256
     with open(os.path.join(UPDATES_DIR, "README.md"), "w", encoding="utf-8", newline="\n") as f:
-        f.write("# Archivos del actualizador\n\nRama técnica: el launcher descarga de aquí solo los archivos que cambian. "
-                "No es una descarga para usuarios: baja el zip desde [Releases](../../releases/latest).\n")
+        f.write("# Updater files\n\nTechnical branch: the launcher downloads only the files that changed from here. "
+                "This is not a download for users: get the zip from [Releases](../../releases/latest).\n")
     for rel in rels:
         dst = os.path.join(UPDATES_DIR, *rel.split("/"))
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.copy2(os.path.join(files_root, *rel.split("/")), dst)
     run(["git", "add", "-A", "-f"], UPDATES_DIR)
     if run(["git", "status", "--porcelain"], UPDATES_DIR):
-        run(["git", "commit", "-q", "-m", f"Archivos del actualizador {version}"], UPDATES_DIR)
+        run(["git", "commit", "-q", "-m", f"Updater files {version}"], UPDATES_DIR)
     return run(["git", "rev-parse", "HEAD"], UPDATES_DIR)
 
 
