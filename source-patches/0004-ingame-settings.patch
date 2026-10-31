@@ -1,0 +1,1319 @@
+diff --git a/crates/mh3u-gfx/src/gx2.rs b/crates/mh3u-gfx/src/gx2.rs
+index 1b5a1d2..ace53ca 100644
+--- a/crates/mh3u-gfx/src/gx2.rs
++++ b/crates/mh3u-gfx/src/gx2.rs
+@@ -90,16 +90,73 @@ calls! {
+ }
+ 
+ const FRAME: Duration = Duration::from_nanos(16_683_333);
+-const MAX_RESOLUTION_SCALE: u32 = 4;
+ 
+ /// The console's TV scan target and its GamePad one.
+ const TV: u32 = 1;
+ 
+ fn resolution_scale(setting: Option<&str>) -> u32 {
+-    setting
+-        .and_then(|value| value.trim().parse::<u32>().ok())
+-        .filter(|scale| (1..=MAX_RESOLUTION_SCALE).contains(scale))
+-        .unwrap_or(1)
++    crate::settings::scale(setting)
++}
++
++/// The present mode to use: the one asked for if the surface has it, else the nearest it has (Mailbox falls back to Immediate).
++fn choose_present_mode(requested: wgpu::PresentMode, available: Option<&[wgpu::PresentMode]>) -> wgpu::PresentMode {
++    match available {
++        Some(modes) if modes.contains(&requested) => requested,
++        Some(modes) if requested == wgpu::PresentMode::Mailbox && modes.contains(&wgpu::PresentMode::Immediate) => {
++            wgpu::PresentMode::Immediate
++        }
++        Some(_) => wgpu::PresentMode::Fifo,
++        None => requested,
++    }
++}
++
++fn wgpu_present_mode(mode: crate::settings::Present) -> wgpu::PresentMode {
++    match mode {
++        crate::settings::Present::Fifo => wgpu::PresentMode::Fifo,
++        crate::settings::Present::FifoRelaxed => wgpu::PresentMode::FifoRelaxed,
++        crate::settings::Present::Mailbox => wgpu::PresentMode::Mailbox,
++        crate::settings::Present::Immediate => wgpu::PresentMode::Immediate,
++    }
++}
++
++/// The pipeline that copies the picture to the window (with CAS's sharpening when `upscaler` is "cas").
++fn build_blit(
++    device: &wgpu::Device,
++    layout: &wgpu::BindGroupLayout,
++    format: wgpu::TextureFormat,
++    upscaler: &str,
++    sharpness: f32,
++) -> wgpu::RenderPipeline {
++    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
++        label: Some("blit"),
++        source: wgpu::ShaderSource::Wgsl(make_blit_shader(upscaler, sharpness).into()),
++    });
++    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
++        label: None,
++        bind_group_layouts: &[Some(layout)],
++        immediate_size: 0,
++    });
++    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
++        label: Some("blit"),
++        layout: Some(&pipeline_layout),
++        vertex: wgpu::VertexState {
++            module: &module,
++            entry_point: Some("vs"),
++            compilation_options: Default::default(),
++            buffers: &[],
++        },
++        fragment: Some(wgpu::FragmentState {
++            module: &module,
++            entry_point: Some("fs"),
++            compilation_options: Default::default(),
++            targets: &[Some(format.into())],
++        }),
++        primitive: wgpu::PrimitiveState::default(),
++        depth_stencil: None,
++        multisample: wgpu::MultisampleState::default(),
++        multiview_mask: None,
++        cache: None,
++    })
+ }
+ 
+ fn target_scale(width: u32, height: u32, requested: u32, max_dimension: u32) -> u32 {
+@@ -126,6 +183,8 @@ pub struct Gx2 {
+     blit: wgpu::RenderPipeline,
+     /// AMD FSR 1.0 (two passes) when it is the chosen upscaler; `blit` stays the plain copy.
+     fsr: Option<crate::fsr::Fsr>,
++    /// The settings in force (the overlay's Settings window changes them while the game runs; `settings.rs`).
++    live: crate::settings::Live,
+     layout: wgpu::BindGroupLayout,
+     sampler: wgpu::Sampler,
+     /// The colour buffers the game has used, by the guest address of their image.
+@@ -275,8 +334,60 @@ impl Gx2 {
+     /// the hunters' names from the game's save folder (to find the live save by).
+     pub fn use_overlay(&mut self, dump_base: std::path::PathBuf, dir: std::path::PathBuf, save_dir: std::path::PathBuf) {
+         if (crate::overlay::enabled() || std::env::var_os("MH3U_FPS").is_some()) && self.d.window.is_some() {
+-            self.overlay = Some(crate::overlay::Overlay::new(dump_base, dir, save_dir));
++            let mut overlay = crate::overlay::Overlay::new(dump_base, dir, save_dir);
++            overlay.use_settings(self.live);
++            self.overlay = Some(overlay);
++        }
++    }
++
++    /// Puts the settings the overlay's window asked for in force. Called at the start of a present, when no draw is in flight.
++    fn apply_live(&mut self, new: crate::settings::Live) {
++        use crate::settings::Upscaler;
++        let old = self.live;
++        let surface_format = self.config.format;
++        if (new.upscaler, new.sharpness) != (old.upscaler, old.sharpness) {
++            self.d.queue.flush();
++            let sharpness = new.sharpness;
++            self.blit = build_blit(&self.d.device, &self.layout, surface_format, new.upscaler.code(), sharpness);
++            self.fsr = (new.upscaler == Upscaler::Fsr && self.d.surface.is_some()).then(|| {
++                crate::fsr::Fsr::new(
++                    &self.d.device,
++                    surface_format,
++                    &self.layout,
++                    make_blit_shader("off", sharpness),
++                    sharpness,
++                )
++            });
++            eprintln!(
++                "[gfx] upscaler now {} (sharpness {sharpness:.2}), changed in the overlay",
++                new.upscaler.code()
++            );
+         }
++        if new.present != old.present
++            && let Some(surface) = &self.d.surface
++        {
++            let modes = surface.get_capabilities(&self.d.adapter).present_modes;
++            let mode = choose_present_mode(wgpu_present_mode(new.present), Some(&modes));
++            if mode != self.config.present_mode {
++                self.d.queue.flush();
++                self.config.present_mode = mode;
++                surface.configure(&self.d.device, &self.config);
++            }
++            eprintln!("[gfx] present mode now {mode:?}, changed in the overlay");
++        }
++        if new.scale != old.scale {
++            // everything made at the old size goes (colour and depth buffers, the depth copies of shadow maps, the bind groups that
++            // hold them) and is made again, at the new size, the next time the game uses it
++            self.d.queue.flush();
++            self.targets.clear();
++            self.caches.depth.clear();
++            self.caches.depth_copies.clear();
++            self.caches.target_version.clear();
++            self.caches.bind_groups.clear();
++            self.render_scale = new.scale;
++            eprintln!("[gfx] internal resolution scale now {}x, changed in the overlay", new.scale);
++        }
++        self.live = new;
+     }
+ 
+     pub fn new(d: Display) -> Gx2 {
+@@ -296,23 +407,10 @@ impl Gx2 {
+         let format = caps.as_ref().map_or(wgpu::TextureFormat::Bgra8Unorm, |caps| {
+             caps.formats.iter().copied().find(|f| !f.is_srgb()).unwrap_or(caps.formats[0])
+         });
+-        let requested_mode = match std::env::var("MH3U_PRESENT_MODE").ok().as_deref() {
+-            Some("mailbox") => wgpu::PresentMode::Mailbox,
+-            Some("immediate") | Some("off") => wgpu::PresentMode::Immediate,
+-            Some("fifo_relaxed") => wgpu::PresentMode::FifoRelaxed,
+-            _ => wgpu::PresentMode::Fifo,
+-        };
+-        let present_mode = if let Some(ref c) = caps {
+-            if c.present_modes.contains(&requested_mode) {
+-                requested_mode
+-            } else if requested_mode == wgpu::PresentMode::Mailbox && c.present_modes.contains(&wgpu::PresentMode::Immediate) {
+-                wgpu::PresentMode::Immediate
+-            } else {
+-                wgpu::PresentMode::Fifo
+-            }
+-        } else {
+-            requested_mode
+-        };
++        let live = crate::settings::Live::from_env();
++        mh3u_rt::input::set_right_stick_gain(live.right_stick as f32 / 100.0);
++        let requested_mode = wgpu_present_mode(live.present);
++        let present_mode = choose_present_mode(requested_mode, caps.as_ref().map(|c| c.present_modes.as_slice()));
+         if present_mode != wgpu::PresentMode::Fifo {
+             eprintln!("[gfx] present mode: {present_mode:?}");
+         }
+@@ -330,11 +428,8 @@ impl Gx2 {
+         if let Some(surface) = &d.surface {
+             surface.configure(&d.device, &config);
+         }
+-        let upscaler = std::env::var("MH3U_UPSCALER").unwrap_or_else(|_| "fsr".to_string()).to_lowercase();
+-        let sharpness: f32 = std::env::var("MH3U_FSR_SHARPNESS")
+-            .ok()
+-            .and_then(|v| v.parse().ok())
+-            .unwrap_or(0.75);
++        let upscaler = live.upscaler.code().to_string();
++        let sharpness = live.sharpness;
+         match upscaler.as_str() {
+             "fsr" => eprintln!(
+                 "[gfx] upscaler: AMD FidelityFX FSR 1.0 (EASU + RCAS, sharpness {sharpness:.2} = {:.2} stops)",
+@@ -343,12 +438,7 @@ impl Gx2 {
+             "cas" => eprintln!("[gfx] upscaler: AMD FidelityFX CAS (sharpness: {sharpness:.2})"),
+             _ => eprintln!("[gfx] upscaler: Bilinear (Off)"),
+         }
+-        let blit_src = make_blit_shader(&upscaler, sharpness);
+         let copy_src = make_blit_shader("off", sharpness);
+-        let module = d.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+-            label: Some("blit"),
+-            source: wgpu::ShaderSource::Wgsl(blit_src.into()),
+-        });
+         let layout = d.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+             label: None,
+             entries: &[
+@@ -370,32 +460,7 @@ impl Gx2 {
+                 },
+             ],
+         });
+-        let pipeline_layout = d.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+-            label: None,
+-            bind_group_layouts: &[Some(&layout)],
+-            immediate_size: 0,
+-        });
+-        let blit = d.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+-            label: Some("blit"),
+-            layout: Some(&pipeline_layout),
+-            vertex: wgpu::VertexState {
+-                module: &module,
+-                entry_point: Some("vs"),
+-                compilation_options: Default::default(),
+-                buffers: &[],
+-            },
+-            fragment: Some(wgpu::FragmentState {
+-                module: &module,
+-                entry_point: Some("fs"),
+-                compilation_options: Default::default(),
+-                targets: &[Some(format.into())],
+-            }),
+-            primitive: wgpu::PrimitiveState::default(),
+-            depth_stencil: None,
+-            multisample: wgpu::MultisampleState::default(),
+-            multiview_mask: None,
+-            cache: None,
+-        });
++        let blit = build_blit(&d.device, &layout, format, &upscaler, sharpness);
+         let fsr = (upscaler == "fsr" && d.surface.is_some()).then(|| crate::fsr::Fsr::new(&d.device, format, &layout, copy_src, sharpness));
+         let sampler = d.device.create_sampler(&wgpu::SamplerDescriptor {
+             mag_filter: wgpu::FilterMode::Linear,
+@@ -409,6 +474,7 @@ impl Gx2 {
+             config,
+             blit,
+             fsr,
++            live,
+             layout,
+             sampler,
+             targets: HashMap::default(),
+@@ -691,6 +757,9 @@ impl Gx2 {
+     /// Shows the TV picture, scaled to the window with the picture's proportions kept.
+     fn present(&mut self) {
+         self.flush_draws();
++        if let Some(new) = crate::settings::take() {
++            self.apply_live(new);
++        }
+         let (Some(window), Some(surface)) = (&self.d.window, &self.d.surface) else {
+             return;
+         };
+diff --git a/crates/mh3u-gfx/src/kbm.rs b/crates/mh3u-gfx/src/kbm.rs
+index 79b7225..15d0cd4 100644
+--- a/crates/mh3u-gfx/src/kbm.rs
++++ b/crates/mh3u-gfx/src/kbm.rs
+@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
+ use std::path::Path;
+ 
+ /// Keys the window keeps for itself: the overlay's and fullscreen's (Alt+Enter, so Enter is not bound either).
+-pub const RESERVED: [&str; 4] = ["F1", "F11", "Enter", "NumpadEnter"];
++pub const RESERVED: [&str; 5] = ["F1", "F2", "F11", "Enter", "NumpadEnter"];
+ 
+ /// The GamePad's buttons by the names the file uses.
+ pub fn button_mask(name: &str) -> Option<u32> {
+diff --git a/crates/mh3u-gfx/src/lib.rs b/crates/mh3u-gfx/src/lib.rs
+index 3d32389..a9aaaf8 100644
+--- a/crates/mh3u-gfx/src/lib.rs
++++ b/crates/mh3u-gfx/src/lib.rs
+@@ -16,6 +16,7 @@ mod perf;
+ mod pipelines;
+ mod queue;
+ mod report;
++pub mod settings;
+ mod shader_cache;
+ mod state;
+ mod texture;
+@@ -363,12 +364,16 @@ impl<F: FnOnce(Display) + Send + 'static> ApplicationHandler for App<F> {
+             return;
+         }
+         let open = mh3u_rt::input::OVERLAY_OPEN.load(std::sync::atomic::Ordering::Relaxed);
+-        let f1 = match &event {
+-            WindowEvent::KeyboardInput { event: k, .. } if k.physical_key == PhysicalKey::Code(winit::keyboard::KeyCode::F1) => {
+-                Some(k.state == ElementState::Pressed && !k.repeat)
+-            }
++        // F1 opens the whole overlay and F2 its Settings window alone; either one closes it again
++        let overlay_key = match &event {
++            WindowEvent::KeyboardInput { event: k, .. } => match k.physical_key {
++                PhysicalKey::Code(winit::keyboard::KeyCode::F1) => Some((false, k.state == ElementState::Pressed && !k.repeat)),
++                PhysicalKey::Code(winit::keyboard::KeyCode::F2) => Some((true, k.state == ElementState::Pressed && !k.repeat)),
++                _ => None,
++            },
+             _ => None,
+         };
++        let f1 = overlay_key.map(|(_, first_press)| first_press);
+         let route = route_event(self.overlay.is_some(), open, f1, is_input(&event));
+         if let (Some(state), Some(w)) = (self.overlay.as_mut(), self.window.as_ref())
+             && route.to_egui
+@@ -378,6 +383,10 @@ impl<F: FnOnce(Display) + Send + 'static> ApplicationHandler for App<F> {
+             overlay::push_input(state.take_egui_input(w));
+         }
+         if route.toggle {
++            mh3u_rt::input::OVERLAY_SETTINGS_ONLY.store(
++                overlay_key.is_some_and(|(settings_only, _)| settings_only),
++                std::sync::atomic::Ordering::Relaxed,
++            );
+             mh3u_rt::input::OVERLAY_TOGGLE.store(true, std::sync::atomic::Ordering::Relaxed);
+             // what the game held is let go, so nothing stays pressed while the overlay is open
+             self.keys.clear();
+diff --git a/crates/mh3u-gfx/src/overlay.rs b/crates/mh3u-gfx/src/overlay.rs
+index 760f166..8317b0f 100644
+--- a/crates/mh3u-gfx/src/overlay.rs
++++ b/crates/mh3u-gfx/src/overlay.rs
+@@ -8,16 +8,50 @@
+ //! What it shows is the blacksmith wishlist (`mh3u_mods`): pieces picked from the recipes, what each needs against the item box and
+ //! pouch of the save the game is playing, a shopping list of it all, and a notice when a piece becomes craftable.
+ 
++use crate::settings::{self, Lang, Live, Present, Upscaler};
+ use mh3u_mods::data::{GameData, KINDS};
+ use mh3u_mods::live;
+ use mh3u_mods::wishlist::{self, Craftable, Piece, Wishlist};
+-use mh3u_rt::input::{OVERLAY_ENABLED, OVERLAY_OPEN, OVERLAY_PRESSES, OVERLAY_TOGGLE, button};
++use mh3u_rt::input::{OVERLAY_ENABLED, OVERLAY_OPEN, OVERLAY_PRESSES, OVERLAY_SETTINGS_ONLY, OVERLAY_TOGGLE, button};
+ use mh3u_rt::mods::{self, Searching};
+ use std::path::PathBuf;
+ use std::sync::atomic::Ordering::Relaxed;
+ use std::sync::{Arc, LazyLock, Mutex};
+ use std::time::{Duration, Instant};
+ 
++/// The overlay's look: the launcher's palette (dark teal panels, its blue for what is selected or under the pointer).
++fn apply_theme(ctx: &egui::Context) {
++    use egui::Color32 as C;
++    let blue = C::from_rgb(0x4f, 0xc3, 0xd6);
++    let blue_deep = C::from_rgb(0x2a, 0x7f, 0x92);
++    let panel = C::from_rgba_unmultiplied(0x10, 0x20, 0x2a, 242);
++    let inset = C::from_rgb(0x0d, 0x18, 0x20);
++    let button = C::from_rgb(0x1b, 0x34, 0x41);
++    let edge = C::from_rgb(0x2b, 0x4a, 0x58);
++    let mut v = egui::Visuals::dark();
++    v.window_fill = panel;
++    v.panel_fill = panel;
++    v.extreme_bg_color = inset;
++    v.faint_bg_color = C::from_rgb(0x14, 0x24, 0x2e);
++    v.window_stroke = egui::Stroke::new(1.0, blue.gamma_multiply(0.6));
++    v.hyperlink_color = blue;
++    v.selection.bg_fill = blue_deep;
++    v.selection.stroke = egui::Stroke::new(1.0, blue);
++    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, edge);
++    v.widgets.inactive.bg_fill = button;
++    v.widgets.inactive.weak_bg_fill = button;
++    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, edge);
++    v.widgets.hovered.bg_fill = edge;
++    v.widgets.hovered.weak_bg_fill = edge;
++    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, blue);
++    v.widgets.active.bg_fill = blue_deep;
++    v.widgets.active.weak_bg_fill = blue_deep;
++    v.widgets.active.bg_stroke = egui::Stroke::new(1.0, blue);
++    v.widgets.open.bg_fill = button;
++    v.widgets.open.weak_bg_fill = button;
++    ctx.set_visuals(v);
++}
++
+ /// The egui context the window's thread and the game thread share.
+ pub static CONTEXT: LazyLock<egui::Context> = LazyLock::new(egui::Context::default);
+ /// The keyboard and mouse bindings, for the overlay's Controls section (empty with them off).
+@@ -132,6 +166,13 @@ pub struct Overlay {
+     fps_frame_count: u32,
+     fps_current: f32,
+     start_time: Instant,
++    /// The settings in force (the Settings window), the sharpness being dragged (in percent) and where the choices are kept.
++    live: Live,
++    sharp_pct: u32,
++    stick_pct: u32,
++    settings_file: PathBuf,
++    /// Opened with F2: the Settings window alone.
++    settings_only: bool,
+ }
+ 
+ /// Why there is no hunter while the game is not in play.
+@@ -166,6 +207,9 @@ impl Overlay {
+             *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(loaded);
+         });
+         let kept = wishlist::any_kept(&dir);
++        apply_theme(&CONTEXT);
++        let settings_file = settings::file(&dir);
++        let live = Live::from_env();
+         eprintln!(
+             "[overlay] F1 or Back + RB opens it; wishlists in {} (one per hunter, read when the hunter is loaded)",
+             dir.join("wishlists").display()
+@@ -202,9 +246,22 @@ impl Overlay {
+             fps_frame_count: 0,
+             fps_current: 0.0,
+             start_time: Instant::now(),
++            live,
++            sharp_pct: (live.sharpness * 100.0).round() as u32,
++            stick_pct: live.right_stick,
++            settings_file,
++            settings_only: false,
+         }
+     }
+ 
++    /// The settings the display starts with (the Settings window shows and changes them from here).
++    pub fn use_settings(&mut self, live: Live) {
++        self.sharp_pct = (live.sharpness * 100.0).round() as u32;
++        self.stick_pct = live.right_stick;
++        self.fps_enabled = live.fps_counter;
++        self.live = live;
++    }
++
+     /// Each frame, from the present pass: opens or closes on a toggle, keeps the live save up to date, and draws when open or when a
+     /// notice is showing.
+     pub fn frame(
+@@ -218,6 +275,7 @@ impl Overlay {
+     ) {
+         if OVERLAY_TOGGLE.swap(false, Relaxed) {
+             self.open = !self.open;
++            self.settings_only = self.open && OVERLAY_SETTINGS_ONLY.load(Relaxed);
+             OVERLAY_OPEN.store(self.open, Relaxed);
+             OVERLAY_PRESSES.lock().unwrap_or_else(|e| e.into_inner()).clear();
+         }
+@@ -234,7 +292,14 @@ impl Overlay {
+         // the game asks for text (a hunter's name): the overlay opens with its keyboard window
+         if mh3u_rt::swkbd::waiting() && !self.open {
+             self.kb_opened = true;
++            self.settings_only = false;
+             self.kb_text.clear();
++            // a hunter's name is 10 characters; once a hunter plays, the prompts are a room's name or a chat line
++            mh3u_rt::swkbd::set_limit(if in_game() {
++                mh3u_rt::swkbd::MOST_TEXT
++            } else {
++                mh3u_rt::swkbd::MOST
++            });
+             self.open = true;
+             OVERLAY_OPEN.store(true, Relaxed);
+         } else if self.kb_opened && !mh3u_rt::swkbd::waiting() {
+@@ -507,7 +572,11 @@ impl Overlay {
+         drop(guard);
+         for n in names {
+             eprintln!("[overlay] craftable now: {n}");
+-            self.notices.push((format!("⚒ {n} can be made now"), Instant::now()));
++            let text = match self.live.lang {
++                Lang::En => format!("⚒ {n} can be made now"),
++                Lang::Es => format!("⚒ ¡{n} ya se puede fabricar!"),
++            };
++            self.notices.push((text, Instant::now()));
+         }
+     }
+ 
+@@ -611,12 +680,13 @@ impl Overlay {
+     }
+ 
+     fn ui(&mut self, ctx: &egui::Context) {
++        let l = self.live.lang;
+         if self.fps_enabled {
+             ctx.request_repaint();
+-            let upscaler_tag = match std::env::var("MH3U_UPSCALER").ok().as_deref().map(str::to_lowercase) {
+-                Some(ref s) if s == "fsr" => " • FSR 1.0",
+-                Some(ref s) if s == "cas" => " • CAS",
+-                _ => "",
++            let upscaler_tag = match self.live.upscaler {
++                Upscaler::Fsr => " • FSR 1.0",
++                Upscaler::Cas => " • CAS",
++                Upscaler::Off => "",
+             };
+             egui::Area::new(egui::Id::new("fps_hud"))
+                 .anchor(egui::Align2::LEFT_TOP, egui::vec2(16.0, 16.0))
+@@ -651,79 +721,129 @@ impl Overlay {
+             return;
+         }
+         if mh3u_rt::swkbd::waiting() {
+-            egui::Window::new("Keyboard")
++            let most = mh3u_rt::swkbd::limit();
++            egui::Window::new(l.p("Keyboard", "Teclado"))
++                .id(egui::Id::new("keyboard"))
+                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                 .collapsible(false)
+                 .show(ctx, |ui| {
+-                    ui.label(format!("The game asks for text (at most {} characters):", mh3u_rt::swkbd::MOST));
+-                    let edit = ui.add(egui::TextEdit::singleline(&mut self.kb_text).char_limit(mh3u_rt::swkbd::MOST));
++                    ui.label(match l {
++                        Lang::En => format!("The game asks for text (at most {most} characters):"),
++                        Lang::Es => format!("El juego pide un texto (máximo {most} caracteres):"),
++                    });
++                    let edit = ui.add(egui::TextEdit::singleline(&mut self.kb_text).char_limit(most));
+                     edit.request_focus();
+-                    let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
++                    // this window is up only while the game asks for text, and the open overlay keeps the keyboard from the game
++                    let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
++                    ui.label(
++                        egui::RichText::new(l.p(
++                            "Enter accepts; the game's B button cancels.",
++                            "Enter acepta; el botón B del juego cancela.",
++                        ))
++                        .small()
++                        .weak(),
++                    );
+                     ui.horizontal(|ui| {
+-                        if (ui.button("OK").clicked() || enter) && !self.kb_text.trim().is_empty() {
++                        if (ui.button(l.p("OK", "Aceptar")).clicked() || enter) && !self.kb_text.trim().is_empty() {
+                             mh3u_rt::swkbd::submit(Some(self.kb_text.trim()));
+                         }
+-                        if ui.button("Cancel").clicked() {
++                        if ui.button(l.p("Cancel", "Cancelar")).clicked() {
+                             mh3u_rt::swkbd::submit(None);
+                         }
+                     });
+                 });
+             return;
+         }
++        if self.settings_only {
++            self.settings_window(ctx);
++            return;
++        }
+         let mut changed = false;
+         let shared = self.data.clone();
+         let guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+-        egui::Window::new("Blacksmith wishlist")
++        egui::Window::new(l.p("Blacksmith wishlist", "Lista de deseos del herrero"))
++            .id(egui::Id::new("wishlist"))
+             .default_pos([24.0, 24.0])
+             .default_width(520.0)
+             .show(ctx, |ui| {
+-                ui.label("F1 or Back + RB closes this. The game is paused for input while it is open.");
++                ui.label(l.p(
++                    "F1 or Back + RB opens and closes this, and the game's B button closes it too. The game gets no controls while it is open.",
++                    "F1 o Back + RB lo abre y cierra, y el botón B del juego también lo cierra. El juego no recibe tus controles mientras está abierto.",
++                ));
+                 let data = match guard.as_ref() {
+                     None => {
+-                        ui.label("Reading the game's data from the dump…");
++                        ui.label(l.p(
++                            "Reading the game's data from the dump…",
++                            "Leyendo los datos del juego desde el dump…",
++                        ));
+                         return;
+                     }
+                     Some(Err(e)) => {
+-                        ui.colored_label(egui::Color32::LIGHT_RED, format!("No game data: {e}"));
++                        ui.colored_label(
++                            egui::Color32::LIGHT_RED,
++                            format!("{}: {e}", l.p("No game data", "Sin datos del juego")),
++                        );
+                         return;
+                     }
+                     Some(Ok(d)) => d,
+                 };
+                 let save = match &self.save {
+                     Save::At(at, _, Some(s)) => {
+-                        ui.label(format!("Hunter: {} (live save at {at:#x})", s.hunter_name));
++                        ui.label(match l {
++                            Lang::En => format!("Hunter: {} (live save at {at:#x})", s.hunter_name),
++                            Lang::Es => format!("Cazador: {} (partida en memoria en {at:#x})", s.hunter_name),
++                        });
+                         Some(s)
+                     }
+                     Save::At(..) | Save::Checking { .. } => {
+-                        ui.label("Checking what the search found…");
++                        ui.label(l.p("Checking what the search found…", "Comprobando lo que encontró la búsqueda…"));
+                         None
+                     }
+                     Save::Searching { .. } => {
+                         if let Searching::Running { done, of } = mods::searching() {
+-                            ui.label(format!("Looking for the live save in memory… {}%", done * 100 / of.max(1)));
++                            let pct = done * 100 / of.max(1);
++                            ui.label(match l {
++                                Lang::En => format!("Looking for the live save in memory… {pct}%"),
++                                Lang::Es => format!("Buscando la partida en memoria… {pct}%"),
++                            });
+                         }
+                         None
+                     }
+                     Save::Waiting { until, reason } => {
+                         if reason == NOT_IN_GAME {
+-                            ui.label("Not in game yet (title screen or slot select).");
++                            ui.label(l.p(
++                                "Not in game yet (title screen or slot select).",
++                                "Aún no estás en partida (pantalla de título o selección de ranura).",
++                            ));
+                         } else if !reason.is_empty() {
+-                            ui.colored_label(egui::Color32::LIGHT_RED, format!("No live save: {reason}"));
++                            ui.colored_label(
++                                egui::Color32::LIGHT_RED,
++                                format!("{}: {reason}", l.p("No live save", "Sin partida en memoria")),
++                            );
+                             let left = until.saturating_duration_since(Instant::now()).as_secs();
+-                            ui.label(format!(
+-                                "Looking again in {left} s (sooner after loading a hunter? reopening does not hurry it)"
+-                            ));
++                            ui.label(match l {
++                                Lang::En => {
++                                    format!("Looking again in {left} s (sooner after loading a hunter? reopening does not hurry it)")
++                                }
++                                Lang::Es => format!("Se buscará de nuevo en {left} s (reabrir esta ventana no lo adelanta)"),
++                            });
+                         }
+                         None
+                     }
+                 };
+                 let (Some(save), Some((hunter, _))) = (save, &self.hunter) else {
+                     ui.separator();
+-                    ui.label(egui::RichText::new("No hunter loaded").strong());
+-                    ui.label("Each hunter has a wishlist of their own; it shows here once a save slot is loaded.");
++                    ui.label(egui::RichText::new(l.p("No hunter loaded", "Ningún cazador cargado")).strong());
++                    ui.label(l.p(
++                        "Each hunter has a wishlist of their own; it shows here once a save slot is loaded.",
++                        "Cada cazador tiene su propia lista de deseos; aparece aquí al cargar una ranura de guardado.",
++                    ));
+                     return;
+                 };
+-                ui.label(format!("Wishlist of {hunter}"));
++                ui.label(match l {
++                    Lang::En => format!("Wishlist of {hunter}"),
++                    Lang::Es => format!("Lista de deseos de {hunter}"),
++                });
+                 let save = Some(save);
+                 let provisional = &self.provisional;
+                 let have = |item: u16| save.map_or(0, |s| s.item_count(item)) + provisional.extra(item);
+@@ -739,7 +859,7 @@ impl Overlay {
+                         });
+                     ui.add(
+                         egui::TextEdit::singleline(&mut self.filter)
+-                            .hint_text("filter by name")
++                            .hint_text(l.p("filter by name", "filtrar por nombre"))
+                             .desired_width(200.0),
+                     );
+                 });
+@@ -766,14 +886,20 @@ impl Overlay {
+                     .map(|(i, n)| format!("+{n} {}", data.item_name(i)))
+                     .collect();
+                 if !quest.is_empty() {
+-                    ui.label(format!("Counted, not in the save yet (+N this quest): {}", quest.join(", ")));
++                    ui.label(match l {
++                        Lang::En => format!("Counted, not in the save yet (+N this quest): {}", quest.join(", ")),
++                        Lang::Es => format!("Contado, aún no está en la partida (+N en esta misión): {}", quest.join(", ")),
++                    });
+                 }
+                 let owns = |k: u8, i: u16| save.is_some_and(|s| s.owns_equipment(k, i));
+                 let statuses = self
+                     .wishlist
+                     .status(|p| data.making_for(p.kind, p.id, owns).map(|m| m.materials), have);
+                 if statuses.is_empty() {
+-                    ui.label("Nothing wished for yet: pick pieces above.");
++                    ui.label(l.p(
++                        "Nothing wished for yet: pick pieces above.",
++                        "Aún no deseas nada: elige piezas arriba.",
++                    ));
+                 }
+                 let mut remove = None;
+                 egui::ScrollArea::vertical().id_salt("wished").max_height(260.0).show(ui, |ui| {
+@@ -781,13 +907,18 @@ impl Overlay {
+                         let p = s.piece;
+                         let name = data.piece_name(p.kind, p.id).unwrap_or("?");
+                         let missing: u32 = s.materials.iter().map(|n| n.missing()).sum();
+-                        let head = if s.craftable {
+-                            format!("✔ {name}: ready")
+-                        } else {
+-                            format!("{name}: {missing} missing")
++                        let head = match (s.craftable, l) {
++                            (true, Lang::En) => format!("✔ {name}: ready"),
++                            (true, Lang::Es) => format!("✔ {name}: lista"),
++                            (false, Lang::En) => format!("{name}: {missing} missing"),
++                            (false, Lang::Es) => format!("{name}: faltan {missing}"),
+                         };
+                         ui.horizontal(|ui| {
+-                            if ui.small_button("✖").on_hover_text("take it off the list").clicked() {
++                            if ui
++                                .small_button("✖")
++                                .on_hover_text(l.p("take it off the list", "quitarla de la lista"))
++                                .clicked()
++                            {
+                                 remove = Some(p);
+                             }
+                             egui::CollapsingHeader::new(head).id_salt(("wish", p.kind, p.id)).show(ui, |ui| {
+@@ -800,13 +931,22 @@ impl Overlay {
+                                 };
+                                 match (data.making_for(p.kind, p.id, owns), &forge, &upgrade) {
+                                     (Some(m), _, _) if !m.from.is_empty() => {
+-                                        ui.label(format!("upgrade from {} (owned)", names(&m.from)));
++                                        ui.label(match l {
++                                            Lang::En => format!("upgrade from {} (owned)", names(&m.from)),
++                                            Lang::Es => format!("mejorar desde {} (la tienes)", names(&m.from)),
++                                        });
+                                     }
+                                     (_, Some(_), Some(u)) => {
+-                                        ui.label(format!("forge (or upgrade from {}, not owned)", names(&u.from)));
++                                        ui.label(match l {
++                                            Lang::En => format!("forge (or upgrade from {}, not owned)", names(&u.from)),
++                                            Lang::Es => format!("forjar (o mejorar desde {}, que no tienes)", names(&u.from)),
++                                        });
+                                     }
+                                     (_, None, Some(u)) => {
+-                                        ui.label(format!("upgrade from {}", names(&u.from)));
++                                        ui.label(match l {
++                                            Lang::En => format!("upgrade from {}", names(&u.from)),
++                                            Lang::Es => format!("mejorar desde {}", names(&u.from)),
++                                        });
+                                     }
+                                     _ => {}
+                                 }
+@@ -832,12 +972,12 @@ impl Overlay {
+                 }
+                 if !statuses.is_empty() {
+                     ui.separator();
+-                    ui.label(egui::RichText::new("Shopping list").strong());
++                    ui.label(egui::RichText::new(l.p("Shopping list", "Lista de compras")).strong());
+                     egui::Grid::new("shopping").striped(true).show(ui, |ui| {
+-                        ui.label("item");
+-                        ui.label("have");
+-                        ui.label("need");
+-                        ui.label("missing");
++                        ui.label(l.p("item", "objeto"));
++                        ui.label(l.p("have", "tienes"));
++                        ui.label(l.p("need", "necesitas"));
++                        ui.label(l.p("missing", "faltan"));
+                         ui.end_row();
+                         for n in Wishlist::shopping(&statuses) {
+                             ui.label(data.item_name(n.item));
+@@ -855,22 +995,33 @@ impl Overlay {
+             });
+         drop(guard);
+         if !self.feed.is_empty() {
+-            egui::Window::new("Events").default_pos([560.0, 300.0]).show(ctx, |ui| {
+-                for line in self.feed.iter().rev() {
+-                    ui.label(line);
+-                }
+-            });
++            egui::Window::new(l.p("Events", "Eventos"))
++                .id(egui::Id::new("events"))
++                .default_pos([560.0, 300.0])
++                .show(ctx, |ui| {
++                    for line in self.feed.iter().rev() {
++                        ui.label(line);
++                    }
++                });
+         }
+         let controls = CONTROLS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+-        egui::Window::new("Controls")
++        self.settings_window(ctx);
++        egui::Window::new(l.p("Controls", "Controles"))
++            .id(egui::Id::new("controls_window"))
+             .default_pos([560.0, 24.0])
+             .default_open(false)
+             .show(ctx, |ui| {
+                 if controls.is_empty() {
+-                    ui.label("Keyboard and mouse controls are off (the default; MH3U_KEYBOARD_CONTROLS=1 or win-run.ps1 -KeyboardControls turns them on): the mouse is the GamePad's touch screen.");
++                    ui.label(l.p(
++                        "Keyboard and mouse controls are off (the default; MH3U_KEYBOARD_CONTROLS=1 or win-run.ps1 -KeyboardControls turns them on): the mouse is the GamePad's touch screen.",
++                        "Los controles de teclado y ratón están desactivados (es lo normal; el launcher los activa con «Teclado»): el ratón es la pantalla táctil del GamePad.",
++                    ));
+                     return;
+                 }
+-                ui.label("Keyboard and mouse (edit input/bindings.json in the build folder, then restart):");
++                ui.label(l.p(
++                    "Keyboard and mouse (edit input/bindings.json in the build folder, then restart):",
++                    "Teclado y ratón (edita input/bindings.json en la carpeta de la compilación y reinicia):",
++                ));
+                 egui::Grid::new("controls").striped(true).show(ui, |ui| {
+                     for (what, keys) in &controls {
+                         ui.label(what);
+@@ -878,7 +1029,10 @@ impl Overlay {
+                         ui.end_row();
+                     }
+                 });
+-                ui.label("F1: this overlay. F11 or Alt+Enter: fullscreen.");
++                ui.label(l.p(
++                    "F1: this overlay. F11 or Alt+Enter: fullscreen.",
++                    "F1: este panel. F11 o Alt+Enter: pantalla completa.",
++                ));
+             });
+         if changed && let Some((_, path)) = &self.hunter {
+             self.kept |= !self.wishlist.pieces.is_empty();
+@@ -889,6 +1043,123 @@ impl Overlay {
+     }
+ }
+ 
++impl Overlay {
++    /// The Settings window: what can change while the game runs. Each change is applied at the next present (`settings::request`) and
++    /// kept in the settings file the launcher reads. Drawn only while the overlay is open, so it costs nothing otherwise.
++    fn settings_window(&mut self, ctx: &egui::Context) {
++        let l = self.live.lang;
++        let mut live = self.live;
++        let mut language = false;
++        egui::Window::new(l.p("Settings", "Ajustes"))
++            .id(egui::Id::new("settings_window"))
++            .default_pos([560.0, 60.0])
++            .default_width(300.0)
++            .show(ctx, |ui| {
++                egui::Grid::new("settings_grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
++                    ui.label(l.p("Internal resolution", "Resolución interna"));
++                    egui::ComboBox::from_id_salt("scale")
++                        .selected_text(format!("{}x ({}×{})", live.scale, 1280 * live.scale, 720 * live.scale))
++                        .show_ui(ui, |ui| {
++                            for s in 1..=settings::MAX_SCALE {
++                                ui.selectable_value(&mut live.scale, s, format!("{s}x ({}×{})", 1280 * s, 720 * s));
++                            }
++                        });
++                    ui.end_row();
++
++                    ui.label(l.p("Upscaler", "Reescalado"));
++                    let name = |u: Upscaler| match u {
++                        Upscaler::Fsr => "AMD FSR 1.0",
++                        Upscaler::Cas => "AMD CAS",
++                        Upscaler::Off => l.p("Off (bilinear)", "Desactivado (bilineal)"),
++                    };
++                    egui::ComboBox::from_id_salt("upscaler")
++                        .selected_text(name(live.upscaler))
++                        .show_ui(ui, |ui| {
++                            for u in [Upscaler::Fsr, Upscaler::Cas, Upscaler::Off] {
++                                ui.selectable_value(&mut live.upscaler, u, name(u));
++                            }
++                        });
++                    ui.end_row();
++
++                    ui.label(l.p("Sharpness", "Nitidez"));
++                    let slider = ui.add_enabled(
++                        live.upscaler != Upscaler::Off,
++                        egui::Slider::new(&mut self.sharp_pct, 20..=100).suffix(" %"),
++                    );
++                    // applied when the slider is let go (or a key moves it), not at every step of a drag: the shader is rebuilt
++                    if slider.drag_stopped() || (slider.changed() && !slider.dragged()) {
++                        live.sharpness = self.sharp_pct as f32 / 100.0;
++                    }
++                    ui.end_row();
++
++                    ui.label(l.p("Frame presentation", "Presentación de cuadros"));
++                    let mode = |p: Present| match p {
++                        Present::Fifo => "V-Sync",
++                        Present::FifoRelaxed => l.p("V-Sync (relaxed)", "V-Sync (relajado)"),
++                        Present::Mailbox => l.p("Mailbox (no tearing, lowest lag)", "Mailbox (sin cortes, menor retardo)"),
++                        Present::Immediate => l.p("Immediate (no V-Sync)", "Inmediato (sin V-Sync)"),
++                    };
++                    egui::ComboBox::from_id_salt("present")
++                        .selected_text(mode(live.present))
++                        .show_ui(ui, |ui| {
++                            for p in [Present::Fifo, Present::Mailbox, Present::Immediate] {
++                                ui.selectable_value(&mut live.present, p, mode(p));
++                            }
++                        });
++                    ui.end_row();
++
++                    ui.label(l.p("FPS counter", "Contador de FPS"));
++                    ui.checkbox(&mut live.fps_counter, "");
++                    ui.end_row();
++
++                    ui.label(l.p("Camera sensitivity (right stick)", "Sensibilidad de cámara (stick derecho)"));
++                    let stick = ui.add(egui::Slider::new(&mut self.stick_pct, 25..=150).suffix(" %"));
++                    if stick.changed() {
++                        // takes effect while dragging (it costs nothing); the file is written when it is let go
++                        mh3u_rt::input::set_right_stick_gain(self.stick_pct as f32 / 100.0);
++                    }
++                    if stick.drag_stopped() || (stick.changed() && !stick.dragged()) {
++                        live.right_stick = self.stick_pct;
++                    }
++                    ui.end_row();
++
++                    ui.label(l.p("Language", "Idioma"));
++                    let label = match live.lang {
++                        Lang::En => "Cambiar a Español",
++                        Lang::Es => "Switch to English",
++                    };
++                    if ui.button(label).clicked() {
++                        live.lang = live.lang.other();
++                        language = true;
++                    }
++                    ui.end_row();
++                });
++                ui.separator();
++                ui.label(
++                    egui::RichText::new(l.p(
++                        "F2 opens and closes this window. The game's B button closes it too.",
++                        "F2 abre y cierra esta ventana. El botón B del juego también la cierra.",
++                    ))
++                    .small()
++                    .weak(),
++                );
++            });
++        if live != self.live {
++            let gfx = (live.upscaler, live.sharpness, live.present, live.scale)
++                != (self.live.upscaler, self.live.sharpness, self.live.present, self.live.scale);
++            self.fps_enabled = live.fps_counter;
++            self.live = live;
++            if gfx {
++                settings::request(live);
++            }
++            settings::save(&self.settings_file, &live);
++            if language {
++                eprintln!("[overlay] language: {}", live.lang.code());
++            }
++        }
++    }
++}
++
+ /// The wishlist's status in a line for the game's item menu (`MH3U_NATIVE_TEXT`): `None` when the wishlist is empty.
+ fn native_line(statuses: &[mh3u_mods::wishlist::Status]) -> Option<String> {
+     if statuses.is_empty() {
+diff --git a/crates/mh3u-gfx/src/settings.rs b/crates/mh3u-gfx/src/settings.rs
+new file mode 100644
+index 0000000..8567853
+--- /dev/null
++++ b/crates/mh3u-gfx/src/settings.rs
+@@ -0,0 +1,276 @@
++//! The settings the overlay's "Settings" window changes while the game runs (`overlay.rs`), and the language of the overlay's text.
++//!
++//! The overlay builds a [`Live`], asks for it with [`request`], and the present pass ([`take`], one atomic load a frame when nothing
++//! changed) applies it: the upscaler's pipelines are rebuilt only when the upscaler or its sharpness changed, the surface is configured
++//! again only when the present mode changed, and the internal resolution only moves the scale the colour buffers are made at (they are
++//! made again the next time the game uses them). The values the player chose are kept in a small `key=value` file ([`save`]) that the
++//! launcher reads at its next start, so there is one place that rules: the launcher's own settings.
++
++use std::path::{Path, PathBuf};
++use std::sync::Mutex;
++use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
++
++/// The language of the overlay's text.
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
++pub enum Lang {
++    #[default]
++    En,
++    Es,
++}
++
++impl Lang {
++    /// `es` or `en` (anything else, and nothing, is English).
++    pub fn parse(text: Option<&str>) -> Lang {
++        match text.map(|t| t.trim().to_ascii_lowercase()).as_deref() {
++            Some("es" | "es-es" | "es_es" | "spanish" | "español") => Lang::Es,
++            _ => Lang::En,
++        }
++    }
++
++    pub fn code(self) -> &'static str {
++        match self {
++            Lang::En => "en",
++            Lang::Es => "es",
++        }
++    }
++
++    /// The English or the Spanish text.
++    pub fn p(self, en: &'static str, es: &'static str) -> &'static str {
++        match self {
++            Lang::En => en,
++            Lang::Es => es,
++        }
++    }
++
++    pub fn other(self) -> Lang {
++        match self {
++            Lang::En => Lang::Es,
++            Lang::Es => Lang::En,
++        }
++    }
++}
++
++/// How the picture is scaled to the window.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Upscaler {
++    Off,
++    Cas,
++    Fsr,
++}
++
++impl Upscaler {
++    pub fn parse(text: &str) -> Upscaler {
++        match text.trim().to_ascii_lowercase().as_str() {
++            "fsr" => Upscaler::Fsr,
++            "cas" => Upscaler::Cas,
++            _ => Upscaler::Off,
++        }
++    }
++
++    pub fn code(self) -> &'static str {
++        match self {
++            Upscaler::Off => "off",
++            Upscaler::Cas => "cas",
++            Upscaler::Fsr => "fsr",
++        }
++    }
++}
++
++/// When a frame is shown (`MH3U_PRESENT_MODE`).
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Present {
++    Fifo,
++    FifoRelaxed,
++    Mailbox,
++    Immediate,
++}
++
++impl Present {
++    pub fn parse(text: Option<&str>) -> Present {
++        match text.map(|t| t.trim().to_ascii_lowercase()).as_deref() {
++            Some("mailbox") => Present::Mailbox,
++            Some("immediate" | "off") => Present::Immediate,
++            Some("fifo_relaxed") => Present::FifoRelaxed,
++            _ => Present::Fifo,
++        }
++    }
++
++    pub fn code(self) -> &'static str {
++        match self {
++            Present::Fifo => "fifo",
++            Present::FifoRelaxed => "fifo_relaxed",
++            Present::Mailbox => "mailbox",
++            Present::Immediate => "immediate",
++        }
++    }
++}
++
++/// The most the internal resolution goes to (a multiple of the console's 1280x720).
++pub const MAX_SCALE: u32 = 4;
++
++/// What can be changed while the game runs.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct Live {
++    pub upscaler: Upscaler,
++    /// 0 to 1, as the launcher's 20 to 100 %.
++    pub sharpness: f32,
++    pub present: Present,
++    /// The internal resolution: 1 to [`MAX_SCALE`] times 1280x720.
++    pub scale: u32,
++    pub fps_counter: bool,
++    pub lang: Lang,
++    /// How far a gamepad's right stick (the camera) goes, in percent of what the pad reports: 25 to 150.
++    pub right_stick: u32,
++}
++
++/// The right stick's percent from a setting: 25 to 150, else 100.
++pub fn right_stick(setting: Option<&str>) -> u32 {
++    setting
++        .and_then(|value| value.trim().parse::<u32>().ok())
++        .filter(|pct| (25..=150).contains(pct))
++        .unwrap_or(100)
++}
++
++impl Live {
++    /// The settings the launcher (or the shell) gave in the environment.
++    pub fn from_env() -> Live {
++        let var = |name: &str| std::env::var(name).ok();
++        Live {
++            upscaler: Upscaler::parse(&var("MH3U_UPSCALER").unwrap_or_else(|| "fsr".into())),
++            sharpness: var("MH3U_FSR_SHARPNESS")
++                .and_then(|v| v.parse().ok())
++                .unwrap_or(0.75f32)
++                .clamp(0.0, 1.0),
++            present: Present::parse(var("MH3U_PRESENT_MODE").as_deref()),
++            scale: scale(var("MH3U_GFX_RESOLUTION_SCALE").as_deref()),
++            fps_counter: std::env::var_os("MH3U_FPS").is_some(),
++            lang: Lang::parse(var("MH3U_UI_LANG").as_deref()),
++            right_stick: right_stick(var("MH3U_RIGHT_STICK_SENS").as_deref()),
++        }
++    }
++}
++
++/// A resolution scale from a setting: 1 to [`MAX_SCALE`], else 1.
++pub fn scale(setting: Option<&str>) -> u32 {
++    setting
++        .and_then(|value| value.trim().parse::<u32>().ok())
++        .filter(|scale| (1..=MAX_SCALE).contains(scale))
++        .unwrap_or(1)
++}
++
++static PENDING: Mutex<Option<Live>> = Mutex::new(None);
++static DIRTY: AtomicBool = AtomicBool::new(false);
++
++/// Asks the present pass to apply `live`.
++pub fn request(live: Live) {
++    *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = Some(live);
++    DIRTY.store(true, Relaxed);
++}
++
++/// The settings asked for since the last call, if any: one atomic load when there are none.
++pub fn take() -> Option<Live> {
++    if !DIRTY.load(Relaxed) {
++        return None;
++    }
++    DIRTY.store(false, Relaxed);
++    PENDING.lock().unwrap_or_else(|e| e.into_inner()).take()
++}
++
++/// Where the launcher reads the player's choices from: `MH3U_INGAME_SETTINGS`, else `ingame_settings.txt` in `dir`.
++pub fn file(dir: &Path) -> PathBuf {
++    std::env::var_os("MH3U_INGAME_SETTINGS")
++        .filter(|v| !v.is_empty())
++        .map_or_else(|| dir.join("ingame_settings.txt"), PathBuf::from)
++}
++
++/// The settings as the file keeps them: the launcher's own names (`scale`, `upscaler`, `fsr_sharpness` in percent, `present_mode`,
++/// `fps_counter`, `ui_language`).
++pub fn to_text(live: &Live) -> String {
++    format!(
++        "scale={}\nupscaler={}\nfsr_sharpness={}\npresent_mode={}\nfps_counter={}\nui_language={}\nright_stick_sens={}\n",
++        live.scale,
++        live.upscaler.code(),
++        (live.sharpness * 100.0).round() as u32,
++        live.present.code(),
++        u8::from(live.fps_counter),
++        live.lang.code(),
++        live.right_stick
++    )
++}
++
++/// Keeps the settings in `path` (the launcher takes them at its next start).
++pub fn save(path: &Path, live: &Live) {
++    if let Some(parent) = path.parent() {
++        let _ = std::fs::create_dir_all(parent);
++    }
++    if let Err(e) = std::fs::write(path, to_text(live)) {
++        eprintln!("[settings] could not save {}: {e}", path.display());
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn language_is_english_unless_spanish() {
++        assert_eq!(Lang::parse(Some("es")), Lang::Es);
++        assert_eq!(Lang::parse(Some(" ES ")), Lang::Es);
++        assert_eq!(Lang::parse(Some("fr")), Lang::En);
++        assert_eq!(Lang::parse(None), Lang::En);
++        assert_eq!(Lang::Es.p("Settings", "Ajustes"), "Ajustes");
++        assert_eq!(Lang::En.other(), Lang::Es);
++    }
++
++    #[test]
++    fn the_scale_stays_in_range() {
++        assert_eq!(scale(Some("3")), 3);
++        assert_eq!(scale(Some("0")), 1);
++        assert_eq!(scale(Some("9")), 1);
++        assert_eq!(scale(Some("x")), 1);
++        assert_eq!(scale(None), 1);
++    }
++
++    #[test]
++    fn the_right_stick_stays_in_range() {
++        assert_eq!(right_stick(Some("60")), 60);
++        assert_eq!(right_stick(Some("10")), 100);
++        assert_eq!(right_stick(Some("999")), 100);
++        assert_eq!(right_stick(None), 100);
++    }
++
++    #[test]
++    fn a_request_is_taken_once() {
++        // one test only touches the shared slot
++        assert_eq!(take(), None);
++        let live = Live {
++            upscaler: Upscaler::Cas,
++            sharpness: 0.5,
++            present: Present::Mailbox,
++            scale: 2,
++            fps_counter: true,
++            lang: Lang::Es,
++            right_stick: 100,
++        };
++        request(live);
++        assert_eq!(take(), Some(live));
++        assert_eq!(take(), None);
++    }
++
++    #[test]
++    fn the_file_uses_the_launchers_names() {
++        let live = Live {
++            upscaler: Upscaler::Fsr,
++            sharpness: 0.75,
++            present: Present::Immediate,
++            scale: 3,
++            fps_counter: false,
++            lang: Lang::En,
++            right_stick: 60,
++        };
++        assert_eq!(
++            to_text(&live),
++            "scale=3\nupscaler=fsr\nfsr_sharpness=75\npresent_mode=immediate\nfps_counter=0\nui_language=en\nright_stick_sens=60\n"
++        );
++    }
++}
+diff --git a/crates/mh3u-rt/src/input.rs b/crates/mh3u-rt/src/input.rs
+index 7b577ee..1883936 100644
+--- a/crates/mh3u-rt/src/input.rs
++++ b/crates/mh3u-rt/src/input.rs
+@@ -133,6 +133,15 @@ pub static INPUT: Input = Input::new();
+ pub static OVERLAY_ENABLED: AtomicBool = AtomicBool::new(false);
+ pub static OVERLAY_OPEN: AtomicBool = AtomicBool::new(false);
+ pub static OVERLAY_TOGGLE: AtomicBool = AtomicBool::new(false);
++/// The overlay opens with F2 (its Settings window alone), not F1 (everything).
++pub static OVERLAY_SETTINGS_ONLY: AtomicBool = AtomicBool::new(false);
++/// The gain of a gamepad's right stick (the camera): 1.0 is what the pad reports. `MH3U_RIGHT_STICK_SENS` (percent) and the overlay's
++/// Settings window set it.
++static RIGHT_STICK_GAIN: AtomicU32 = AtomicU32::new(0x3f80_0000);
++
++pub fn set_right_stick_gain(gain: f32) {
++    store(&RIGHT_STICK_GAIN, gain.clamp(0.2, 1.5));
++}
+ static SWALLOWED: AtomicU32 = AtomicU32::new(0);
+ pub static OVERLAY_PRESSES: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+ /// Back (View, Select) and the right shoulder button held together open and close the overlay. The game has no use for the pair:
+@@ -230,6 +239,7 @@ impl Input {
+             let held = before | mask;
+             // only the press that completes the combination toggles (a repeated press of a held button does not)
+             if OVERLAY_ENABLED.load(Relaxed) && before & OVERLAY_COMBO != OVERLAY_COMBO && held & OVERLAY_COMBO == OVERLAY_COMBO {
++                OVERLAY_SETTINGS_ONLY.store(false, Relaxed);
+                 OVERLAY_TOGGLE.store(true, Relaxed);
+                 SWALLOWED.fetch_or(OVERLAY_COMBO, Relaxed);
+             } else if OVERLAY_OPEN.load(Relaxed) {
+@@ -285,8 +295,11 @@ impl Input {
+             .sample(std::time::Instant::now());
+         let mouse = [0.0, 0.0, mx, my];
+         let heard = pads_heard();
++        let gain = load(&RIGHT_STICK_GAIN);
+         for (i, o) in out.iter_mut().enumerate() {
+             let p = if heard { load(&self.pad_sticks[i]) } else { 0.0 };
++            // the right stick (the camera) as far as the player wants it
++            let p = if i >= 2 { (p * gain).clamp(-1.0, 1.0) } else { p };
+             *o = if p.abs() > 0.05 {
+                 p
+             } else {
+diff --git a/crates/mh3u-rt/src/swkbd.rs b/crates/mh3u-rt/src/swkbd.rs
+index 1674fb1..1f79a1d 100644
+--- a/crates/mh3u-rt/src/swkbd.rs
++++ b/crates/mh3u-rt/src/swkbd.rs
+@@ -10,15 +10,32 @@
+ //! - **Each frame** (`FUN_0293c0b0`): with the state 2 (shown), `SwkbdIsDecideOkButton` or `SwkbdIsDecideCancelButton` true
+ //!   calls the game's receiver with the text from `SwkbdGetInputFormString` (UTF-16, ending in 0).
+ //!
+-//! The text comes from `MH3U_SWKBD_TEXT` when set (taken at once), else from the overlay's keyboard window (`submit`).
++//! The text comes from `MH3U_SWKBD_TEXT` when set (taken at once, for the first prompt only: the launcher sets it to make a new
++//! hunter's name), else from the overlay's keyboard window (`submit`): every later prompt (a room's name, a chat line) is typed there.
+ 
+ use std::sync::Mutex;
++use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+ 
+ /// Where the typed text is put for the game (UTF-16BE, ending in 0): in the mods' buffer (`native_text::BUFFER`), past the
+ /// native menu's texts.
+ pub const TEXT_AT: u32 = crate::native_text::BUFFER + 0x8000;
+-/// The most characters taken (the hunter's name field holds 10).
++/// The most characters taken for a hunter's name (its field holds 10).
+ pub const MOST: usize = 10;
++/// The most taken for any other text (a room's name, a chat line), once a hunter is playing.
++pub const MOST_TEXT: usize = 30;
++
++/// The limit in force: the overlay sets it when it opens its keyboard window (`MOST` before a hunter plays, else `MOST_TEXT`).
++static LIMIT: AtomicUsize = AtomicUsize::new(MOST);
++/// `MH3U_SWKBD_TEXT` was given to a prompt already.
++static ENV_TAKEN: AtomicBool = AtomicBool::new(false);
++
++pub fn limit() -> usize {
++    LIMIT.load(Relaxed)
++}
++
++pub fn set_limit(most: usize) {
++    LIMIT.store(most.clamp(1, MOST_TEXT), Relaxed);
++}
+ 
+ /// The input form's states, as `SwkbdGetStateInputForm` gives them.
+ pub const HIDDEN: u32 = 0;
+@@ -39,9 +56,14 @@ static KEYBOARD: Mutex<Keyboard> = Mutex::new(Keyboard {
+     text: String::new(),
+ });
+ 
+-/// The text as the game takes it: at most `MOST` characters, no control characters.
++/// The text as the game takes it: at most `limit()` characters, no control characters.
+ pub fn clean(text: &str) -> String {
+-    text.chars().filter(|c| !c.is_control()).take(MOST).collect()
++    clean_to(text, limit())
++}
++
++/// `clean` with the limit given.
++pub fn clean_to(text: &str, most: usize) -> String {
++    text.chars().filter(|c| !c.is_control()).take(most).collect()
+ }
+ 
+ /// UTF-16BE with a terminating 0.
+@@ -112,7 +134,14 @@ impl Keyboard {
+ 
+ /// A call from the game (see `Keyboard::call`).
+ pub fn call(name: &str, write: impl FnOnce(u32, &[u8])) -> Option<u32> {
+-    let env = std::env::var("MH3U_SWKBD_TEXT").ok();
++    let env = if ENV_TAKEN.load(Relaxed) {
++        None
++    } else {
++        std::env::var("MH3U_SWKBD_TEXT").ok().filter(|t| !t.is_empty())
++    };
++    if env.is_some() && name.starts_with("SwkbdAppear") {
++        ENV_TAKEN.store(true, Relaxed);
++    }
+     KEYBOARD.lock().unwrap_or_else(|e| e.into_inner()).call(name, env.as_deref(), write)
+ }
+ 
+@@ -190,11 +219,19 @@ mod tests {
+         assert_eq!(call(&mut k, "SwkbdIsDecideCancelButton__3RplFPb", None).0, 1);
+     }
+ 
++    #[test]
++    fn a_chat_line_is_longer_than_a_name() {
++        let line = "Hello hunters, ready for the Rathalos?";
++        assert_eq!(clean_to(line, MOST).chars().count(), MOST);
++        assert_eq!(clean_to(line, MOST_TEXT), &line[..MOST_TEXT]);
++        assert_eq!(clean_to("ab	c", MOST_TEXT), "abc");
++    }
++
+     #[test]
+     fn the_text_fits_its_place() {
+         assert_eq!(clean("a\nb"), "ab");
+         assert_eq!(clean("ハンターハンターハンター").chars().count(), MOST);
+         const { assert!(TEXT_AT >= crate::native_menu::DESC_AT + crate::native_menu::DESC_MOST as u32) };
+-        const { assert!(TEXT_AT + 2 * (MOST as u32 + 1) < crate::native_text::BUFFER + 0x10_0000) };
++        const { assert!(TEXT_AT + 2 * (MOST_TEXT as u32 + 1) < crate::native_text::BUFFER + 0x10_0000) };
+     }
+ }

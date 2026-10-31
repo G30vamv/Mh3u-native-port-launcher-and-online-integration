@@ -33,7 +33,7 @@ try:
 except Exception:  # update support is optional; the launcher must work without it
     updater = None
 
-APP_VERSION = "v0.9.1"
+APP_VERSION = "v0.9.2"
 
 # Header update widget colors (state -> label color) and button looks: (fg, hover)
 UPDATE_COLORS = {"info": "#9db3ba", "ok": "#7fcfa6", "warn": "#eab84c", "error": "#e07a6f"}
@@ -43,6 +43,64 @@ UPDATE_BTN_READY = ("#b8791e", "#d4922a")
 # Bump when the translator output changes (e.g. more functions discovered). A game.dll built
 # by an older translator lacks functions the online code needs ("not a translated function").
 TRANSLATOR_REV = "2"
+
+# Where the game keeps what the player changed in its F1 overlay (Settings window). The launcher takes it into its own
+# configuration the next time it starts or launches the game, and deletes the file: the launcher's settings stay the one place that rules.
+INGAME_SETTINGS_FILE = "ingame_settings.txt"
+UI_LANGUAGES = ("auto", "es", "en")
+
+
+def system_ui_language():
+    """'es' or 'en' from the Windows display language ('en' for anything else)."""
+    try:
+        import ctypes
+
+        return "es" if (ctypes.windll.kernel32.GetUserDefaultUILanguage() & 0x3FF) == 0x0A else "en"
+    except Exception:
+        return "en"
+
+
+def resolve_language(setting):
+    """The language to use for a `ui_language` setting ('auto', 'es' or 'en'): 'es' or 'en'.
+    The launcher's own translation will use this too; today it only drives the game's F1 overlay."""
+    value = str(setting or "auto").strip().lower()
+    return value if value in ("es", "en") else system_ui_language()
+
+
+def read_ingame_settings(path):
+    """The launcher settings in the game's settings file, validated ({} when there is none or it is unreadable)."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return {}
+    raw = {}
+    for line in lines:
+        key, sep, value = line.partition("=")
+        if sep:
+            raw[key.strip()] = value.strip()
+    found = {}
+    if raw.get("scale") in ("1", "2", "3", "4"):
+        found["scale"] = raw["scale"]
+    if raw.get("upscaler") in ("fsr", "cas", "off"):
+        found["upscaler"] = raw["upscaler"]
+    if raw.get("present_mode") in ("fifo", "mailbox", "immediate"):
+        found["present_mode"] = raw["present_mode"]
+    if raw.get("fps_counter") in ("0", "1"):
+        found["fps"] = raw["fps_counter"] == "1"
+    if raw.get("ui_language") in ("es", "en"):
+        found["ui_language"] = raw["ui_language"]
+    try:
+        stick = int(raw["right_stick_sens"])
+        if 25 <= stick <= 150:
+            found["right_stick_sens"] = stick
+    except (KeyError, ValueError):
+        pass
+    try:
+        found["fsr_sharpness"] = min(100, max(20, int(raw["fsr_sharpness"])))
+    except (KeyError, ValueError):
+        pass
+    return found
 
 
 def dll_rev_path(out_dir):
@@ -381,6 +439,8 @@ class LauncherLogic:
             "upscaler": "fsr",
             "fsr_sharpness": 75,
             "build_lto": False,
+            "ui_language": "auto",
+            "right_stick_sens": 100,
         }
         if os.path.exists(config_path):
             try:
@@ -389,6 +449,18 @@ class LauncherLogic:
                     defaults.update(saved)
             except Exception as e:
                 print(f"Error loading config: {e}")
+
+        # What the player changed in the game's own overlay since the last time
+        ingame_path = os.path.join(get_base_dir(), INGAME_SETTINGS_FILE)
+        ingame = read_ingame_settings(ingame_path)
+        if ingame:
+            defaults.update(ingame)
+            try:
+                os.remove(ingame_path)
+                with open(config_path, "w", encoding="utf-8") as f:
+                    json.dump(defaults, f, indent=4)
+            except OSError as e:
+                print(f"Error saving config: {e}")
 
         # Sanitize out_dir: if it contains an absolute path from another machine that does not exist, reset to current user's default
         cfg_out = defaults.get("out_dir", "")
@@ -424,6 +496,37 @@ class LauncherLogic:
                             defaults["games_dir"] = c_dir
                         break
         return defaults
+
+    def language(self):
+        """'es' or 'en': the language chosen for the game's overlay (and, later, for the launcher itself)."""
+        return resolve_language(self.config.get("ui_language"))
+
+    def import_ingame_settings(self):
+        """Takes into the configuration what the player changed in the game's overlay (see INGAME_SETTINGS_FILE)."""
+        path = os.path.join(get_base_dir(), INGAME_SETTINGS_FILE)
+        found = read_ingame_settings(path)
+        if not found:
+            return False
+        self.config.update(found)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        self.save_config()
+        self.sync_widgets_from_config()
+        return True
+
+    def sync_widgets_from_config(self):
+        """Shows the configuration in the widgets again after it changed outside them (the window overrides this)."""
+
+    def on_ui_language_changed(self, value):
+        if "Español" in value:
+            self.config["ui_language"] = "es"
+        elif "English" in value:
+            self.config["ui_language"] = "en"
+        else:
+            self.config["ui_language"] = "auto"
+        self.save_config()
 
     def save_config(self):
         """Saves current configuration to JSON file."""
@@ -564,6 +667,12 @@ class LauncherLogic:
         self.save_config()
         if hasattr(self, "lbl_quick_backend"):
             self.lbl_quick_backend.configure(text=f"API Gráfica: {'DirectX 12' if self.config['gfx_backend'] == 'dx12' else 'Vulkan'}")
+
+    def on_right_stick_changed(self, value):
+        pct = int(round(value))
+        self.lbl_stick_val.configure(text=f"{pct}%")
+        self.config["right_stick_sens"] = pct
+        self.save_config()
 
     def on_mouse_sens_changed(self, value):
         sens_int = int(round(value))
@@ -1517,6 +1626,9 @@ class LauncherLogic:
         if self.config.get("fullscreen", True):
             run_args.append("--fullscreen")
 
+        # What was changed in the game's overlay the last time counts before the environment is made
+        self.import_ingame_settings()
+
         # Prepare environment variables
         env = os.environ.copy()
         base_dir = get_base_dir()
@@ -1575,8 +1687,16 @@ class LauncherLogic:
         detected_hunter = get_hunter_name_from_save(self.config.get("out_dir", DEFAULT_OUT_DIR))
         hunter_name = detected_hunter or self.config.get("hunter_name") or self.config.get("online_hunter_name", "Hunter")
         if hunter_name:
-            env["MH3U_SWKBD_TEXT"] = hunter_name
             env["MH3U_HUNTER_NAME"] = hunter_name
+            # Only a new hunter's name is typed for the player (the first keyboard prompt); the rest (a room's name, the chat)
+            # opens the keyboard window of the game's overlay
+            if not detected_hunter:
+                env["MH3U_SWKBD_TEXT"] = hunter_name
+
+        # Language of the game's overlay and where it keeps the settings changed there
+        env["MH3U_UI_LANG"] = self.language()
+        env["MH3U_RIGHT_STICK_SENS"] = str(int(self.config.get("right_stick_sens", 100)))
+        env["MH3U_INGAME_SETTINGS"] = os.path.join(base_dir, INGAME_SETTINGS_FILE)
 
         # Online hooks environment preparation
         if self.config.get("online_enabled", False):

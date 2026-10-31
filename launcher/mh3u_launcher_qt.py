@@ -212,6 +212,27 @@ class MH3ULauncherApp(LauncherLogic):
         # the window handle exists once it is shown
         winfx.style_window(self.window.winId(), self.acrylic)
 
+    def sync_widgets_from_config(self):
+        """The game's overlay changed settings: show them (called from the thread that launches the game or from the window)."""
+        c = self.config
+        scale_map = {"1": "1x (720p)", "2": "2x (1440p 2K)", "3": "3x (4K UHD)", "4": "4x (5K Ultra)"}
+        present_map = {"mailbox": "Mailbox (Fast-Sync)", "fifo": "VSync Clásico (Fifo)", "immediate": "Desactivado (OFF)"}
+        upscaler_map = {"fsr": "FSR 1.0 (EASU + RCAS)", "cas": "AMD CAS (Solo Nitidez)", "off": "Desactivado (Nativo)"}
+        self.opt_scale.set(scale_map.get(str(c.get("scale", "2")), "2x (1440p 2K)"))
+        self.opt_present.set(present_map.get(c.get("present_mode", "mailbox"), "Mailbox (Fast-Sync)"))
+        self.opt_upscaler.set(upscaler_map.get(c.get("upscaler", "fsr"), "FSR 1.0 (EASU + RCAS)"))
+        sharp = c.get("fsr_sharpness", 75)
+        self.slider_sharpness.set(sharp)
+        self.lbl_sharpness_val.configure(text=f"{sharp}%")
+        if c.get("fps", False):
+            self.chk_fps.select()
+        else:
+            self.chk_fps.deselect()
+        self.opt_ui_language.set({"es": "Español", "en": "English"}.get(c.get("ui_language", "auto"), "Automático"))
+        stick = int(c.get("right_stick_sens", 100))
+        self.slider_stick.set(stick)
+        self.lbl_stick_val.configure(text=f"{stick}%")
+
     def on_acrylic_toggled(self):
         self.config["acrylic"] = bool(self.chk_acrylic.get())
         self.save_config()
@@ -576,6 +597,12 @@ class MH3ULauncherApp(LauncherLogic):
         sl.addWidget(self.slider_sharpness)
         g.addWidget(sharp)
 
+        g.addWidget(Label("Idioma del panel del juego (F1):", None, 10.5, bold=True))
+        self.opt_ui_language = Segmented(["Automático", "Español", "English"], self.on_ui_language_changed)
+        self.opt_ui_language.set({"es": "Español", "en": "English"}.get(self.config.get("ui_language", "auto"), "Automático"))
+        g.addWidget(self.opt_ui_language)
+        g.addWidget(_hint("💡 Idioma de los ajustes y del teclado dentro del juego. «Automático» sigue el idioma de Windows."))
+
         g.addWidget(Label("Ventana", None, 10.5, bold=True))
         self.chk_acrylic = CheckBox("Efecto Acrylic (el escritorio se transparenta; reinicia el launcher)", self.on_acrylic_toggled)
         if self.config.get("acrylic", False):
@@ -724,6 +751,20 @@ class MH3ULauncherApp(LauncherLogic):
         self.slider_sens.set(int(round(raw_sens * 10000)))
         sn.addWidget(self.slider_sens)
         bl.addWidget(sens)
+
+        stick, st = _card("inset", 12)
+        head = QHBoxLayout()
+        head.addWidget(Label("Sensibilidad de Cámara (Stick derecho del mando):", None, 10, bold=True))
+        head.addStretch(1)
+        raw_stick = int(self.config.get("right_stick_sens", 100))
+        self.lbl_stick_val = Label(f"{raw_stick}%", "#4fc3d6", 10, bold=True)
+        head.addWidget(self.lbl_stick_val)
+        st.addLayout(head)
+        self.slider_stick = Slider(25, 150, self.on_right_stick_changed)
+        self.slider_stick.set(raw_stick)
+        st.addWidget(self.slider_stick)
+        st.addWidget(_hint("💡 100% es lo que reporta el mando; baja el valor si la cámara se siente demasiado rápida. También se cambia dentro del juego (F2)."))
+        bl.addWidget(stick)
         lay.addWidget(base)
         lay.addStretch(1)
         return _transparent_scroll(inner)

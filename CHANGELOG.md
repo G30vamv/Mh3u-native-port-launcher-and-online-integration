@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format follows [Kee
 
 Every entry is also published as the notes of its [GitHub Release](../../releases). The interface of the launcher is still in Spanish; a full English translation is planned.
 
+## [0.9.2] - 2026-10-31
+
+### Added
+- **In-game settings menu.** Press F2 while playing (or F1 for the full overlay) to change the internal resolution, upscaler, sharpness, V-Sync mode, FPS counter, camera sensitivity and language without leaving the game. The game's B button closes it. What you change is remembered and shows up in the launcher the next time you open it.
+- **Camera sensitivity for the controller's right stick**, in the Controls tab and in the in-game menu.
+- **Language setting for the in-game menu** (English or Spanish, Windows' language by default), in the Graphics tab.
+- The in-game menu now uses the launcher's blue.
+
+### Fixed
+- **Room names and chat messages can be typed in game.** The keyboard used to fill in your hunter name every time it appeared; now it only does that when you create a new hunter. Enter accepts the text.
+- **Dark patches in the shadows** after changing the internal resolution during a hunt.
+
 ## [0.9.1] - 2026-10-31
 
 ### Removed
