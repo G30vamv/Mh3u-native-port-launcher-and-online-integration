@@ -1,0 +1,59 @@
+﻿============================================================
+  MONSTER HUNTER 3 ULTIMATE - PORT NATIVO DE PC (v0.9.1)
+  Launcher desarrollado por: g30wolff99
+============================================================
+
+¡Bienvenido al launcher oficial de Monster Hunter 3 Ultimate para PC!
+
+Este paquete es 100% PORTABLE y AUTÓNOMO (funciona directamente al descomprimir):
+- Clang/LLD portátil: el launcher lo descarga una sola vez (~90 MB) con un clic cuando lo necesites.
+- Escalado AMD FidelityFX FSR 1.0 real (EASU + RCAS) y AMD CAS integrado en Vulkan/DirectX 12.
+- Interfaz de cristal con resumen en vivo de tus ajustes; efecto Acrylic opcional (solo Windows 11).
+- Soporte para optimización inter-archivos ThinLTO (-flto=thin + -O3).
+- Motor nativo 'mh3u-tools.exe' optimizado con contador de FPS e interfaz fluida.
+- Launcher gráfico oficial v0.9.1 con registro en tiempo real escroleable.
+
+------------------------------------------------------------
+PASOS RÁPIDOS PARA JUGAR (SOLO LA PRIMERA VEZ):
+------------------------------------------------------------
+1. Abre "MH3U.exe".
+2. Ve a la pestaña "🛠️ Instalación & Dump":
+   - Si tienes tu carpeta con el juego base (0005000010118300) y la
+     actualización v32 (0005000e10118300), pulsa "Examinar..." y selecciónala.
+     (El launcher detectará automáticamente ambos dumps y los marcará en verde).
+   - Si Clang aparece en rojo, pulsa 'Descargar Clang Portátil' (o acepta la descarga al compilar).
+   - Puedes activar la opción "🚀 Optimización LTO" para obtener el máximo
+     rendimiento de CPU y estabilidad de fotogramas en tu procesador.
+3. Haz clic en el botón naranja:
+   "🚀 Traducir y Compilar Port (Crear game.dll)"
+   - El launcher traducirá el juego y compilará los archivos nativos
+     en paralelo con tu procesador.
+   - Verás la barra de progreso y el contador de archivos avanzar en vivo.
+   - (Este paso toma aprox. 1 a 2 minutos y solo se hace UNA VEZ).
+4. En "🎨 Configuración Gráfica":
+   - Puedes configurar resolución nativa (1x, 2x 1440p, 4K),
+     el escalador AMD FSR 1.0 o AMD CAS, y el nivel de nitidez.
+   - La pestaña "Controles y Mandos" tiene la disposición del mando y la sensibilidad de cámara
+     (el mapeado de botones llegará en una próxima versión).
+5. ¡Listo! Pulsa en "🎮 JUGAR".
+
+------------------------------------------------------------
+CONSEJO IMPORTANTE:
+------------------------------------------------------------
+- Para jugar en solitario las misiones de la taberna de Tanzia (Rango Alto y G),
+  habla con el marinero y selecciona:
+  "Puerto Tanzia -> Individual -> Marina o Taberna".
+  No selecciones "Multijugador" si no estás conectado a una sala de red.
+
+¡Buena caza!
+
+- Mando o teclado: en la pantalla principal, sección 'Acciones Frecuentes', elige
+  '¿Juegas con mando o teclado?'. 'Teclado' activa teclado y ratón (por defecto);
+  'Mando' los desactiva para que la ventana no capture el cursor.
+- Mandos compatibles: Xbox y compatibles XInput (incluye receptores 2.4 GHz y GameSir),
+  DualSense (PS5) y DualShock 4 (PS4) por cable o Bluetooth, y la mayoría de mandos HID
+  genéricos. No hace falta Steam ni DS4Windows. Si tu mando no responde, ciérralos (o
+  desactiva la emulación) y reinicia el juego.
+  Si usas HidHide (DSX, DS4Windows) y el mando está oculto, el launcher te ofrece permitir
+  a MH3U leerlo al pulsar JUGAR (pide permisos de administrador); con DSX o DS4Windows
+  abiertos no hace falta.

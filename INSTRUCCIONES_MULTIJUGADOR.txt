@@ -1,0 +1,71 @@
+================================================================================
+  MULTIJUGADOR ONLINE - MONSTER HUNTER 3 ULTIMATE (PC)
+================================================================================
+
+Pueden jugar hasta 4 cazadores. Una persona es el ANFITRIÓN (HOST) y los demás
+se unen a ella como CLIENTES.
+
+--------------------------------------------------------------------------------
+ANTES DE EMPEZAR (todos los jugadores)
+--------------------------------------------------------------------------------
+1. Instalen Radmin VPN (gratis, sin registro) en todos los PC.
+2. Uno crea una red en Radmin VPN y los demás se unen con su nombre y contraseña.
+3. Comprueben que todos aparecen conectados (en verde) en esa red.
+
+--------------------------------------------------------------------------------
+SI ERES EL ANFITRIÓN (HOST)
+--------------------------------------------------------------------------------
+1. Abre el Launcher y entra a la pestaña "Multijugador".
+2. Activa el interruptor "Habilitar Modo Multijugador Online".
+   Windows pedirá permisos de administrador una sola vez: acepta.
+3. Elige "Crear Servidor de Sala (Host)".
+4. En "Tu IP para amigos" elige la IP de Radmin VPN (empieza por 26.)
+   y pulsa "Copiar IP". Envíasela a tus amigos.
+5. Pulsa "Guardar Parámetros de Red".
+6. Ve a la pestaña "Principal" y pulsa JUGAR.
+   (El servidor se inicia solo; no tienes que hacer nada más.)
+7. En el juego, habla con el Barquero (Neko) en Aldea de Moga y elige:
+   "Puerto Tanzia" -> "Modo en red". Crea tu sala y espera a tus amigos.
+
+IMPORTANTE: no cierres el Launcher mientras juegues.
+
+--------------------------------------------------------------------------------
+SI TE UNES A UN AMIGO (CLIENTE)
+--------------------------------------------------------------------------------
+1. Entra a la red de Radmin VPN de tu amigo.
+2. Abre el Launcher y entra a la pestaña "Multijugador".
+3. Activa el interruptor "Habilitar Modo Multijugador Online" y acepta el
+   permiso de administrador.
+4. Elige "Unirse a una Sala (Cliente)".
+5. Pega la IP que te dio tu amigo en "IP del Anfitrión / Amigo".
+6. Pulsa "Probar Ping". Si sale en verde, todo está bien.
+7. Escribe tu nombre de cazador y pulsa "Guardar Parámetros de Red".
+8. Tu amigo (el anfitrión) debe tener el juego abierto ANTES de que tú pulses
+   JUGAR. Ve a la pestaña "Principal" y pulsa JUGAR.
+9. En el juego, habla con el Barquero (Neko) y elige:
+   "Puerto Tanzia" -> "Modo en red". Busca la sala de tu amigo y entra.
+
+--------------------------------------------------------------------------------
+SI ALGO NO FUNCIONA
+--------------------------------------------------------------------------------
+• "Probar Ping" sale en rojo:
+  - Revisa que los dos estén conectados en la misma red de Radmin VPN.
+  - Revisa que la IP esté bien escrita (la del anfitrión, empieza por 26.).
+  - Pide al anfitrión que abra el juego primero.
+
+• No ven la sala del otro:
+  - Ejecuta "ABRIR_FIREWALL_ONLINE.bat" como administrador (clic derecho ->
+    Ejecutar como administrador) en TODOS los PC y vuelve a intentarlo.
+
+• El Launcher no pidió permisos al activar el interruptor:
+  - Apaga y vuelve a encender el interruptor de Multijugador.
+
+• Se corta el audio o bajan los FPS siendo anfitrión:
+  - Cierra otros programas pesados. El anfitrión ejecuta el juego y el
+    servidor a la vez, así que necesita el PC más potente del grupo.
+
+--------------------------------------------------------------------------------
+Agradecimientos especiales a:
+- glinesbdev (Motor de recompilación nativa para PC)
+- Matt Wood / Matt-Wood-23 (Ingeniería inversa de protocolos y arquitectura online)
+================================================================================
