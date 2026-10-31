@@ -1,5 +1,5 @@
 ﻿============================================================
-  MONSTER HUNTER 3 ULTIMATE - PORT NATIVO DE PC (v0.9.1)
+  MONSTER HUNTER 3 ULTIMATE - PORT NATIVO DE PC (v0.9.2)
   Launcher desarrollado por: g30wolff99
 ============================================================
 
@@ -11,7 +11,7 @@ Este paquete es 100% PORTABLE y AUTÓNOMO (funciona directamente al descomprimir
 - Interfaz de cristal con resumen en vivo de tus ajustes; efecto Acrylic opcional (solo Windows 11).
 - Soporte para optimización inter-archivos ThinLTO (-flto=thin + -O3).
 - Motor nativo 'mh3u-tools.exe' optimizado con contador de FPS e interfaz fluida.
-- Launcher gráfico oficial v0.9.1 con registro en tiempo real escroleable.
+- Launcher gráfico oficial v0.9.2 con registro en tiempo real escroleable.
 
 ------------------------------------------------------------
 PASOS RÁPIDOS PARA JUGAR (SOLO LA PRIMERA VEZ):
@@ -35,6 +35,8 @@ PASOS RÁPIDOS PARA JUGAR (SOLO LA PRIMERA VEZ):
      el escalador AMD FSR 1.0 o AMD CAS, y el nivel de nitidez.
    - La pestaña "Controles y Mandos" tiene la disposición del mando y la sensibilidad de cámara
      (el mapeado de botones llegará en una próxima versión).
+   - Dentro del juego, F2 abre unos ajustes rápidos (resolución, reescalado, nitidez, VSync,
+     contador de FPS, sensibilidad de cámara e idioma); F1 abre el panel completo. El botón B del mando los cierra.
 5. ¡Listo! Pulsa en "🎮 JUGAR".
 
 ------------------------------------------------------------
