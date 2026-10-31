@@ -33,7 +33,7 @@ try:
 except Exception:  # update support is optional; the launcher must work without it
     updater = None
 
-APP_VERSION = "v0.9.0"
+APP_VERSION = "v0.9.1"
 
 # Header update widget colors (state -> label color) and button looks: (fg, hover)
 UPDATE_COLORS = {"info": "#9db3ba", "ok": "#7fcfa6", "warn": "#eab84c", "error": "#e07a6f"}

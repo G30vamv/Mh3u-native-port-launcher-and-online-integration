@@ -4,6 +4,11 @@ All notable changes to this project are documented here. The format follows [Kee
 
 Every entry is also published as the notes of its [GitHub Release](../../releases). The interface of the launcher is still in Spanish; a full English translation is planned.
 
+## [0.9.1] - 2026-10-31
+
+### Removed
+- Old artwork.
+
 ## [0.9.0] - 2026-10-30
 
 A big visual and graphics release.
